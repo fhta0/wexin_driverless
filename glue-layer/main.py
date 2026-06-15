@@ -25,6 +25,46 @@ from message_queue import MessageQueue
 MAX_MESSAGES_PER_MINUTE = 3  # 每分钟最多回复 3 条
 MESSAGE_WINDOW_SECONDS = 60  # 时间窗口 60 秒
 
+
+def check_autopilot_enabled() -> bool:
+    """检查 SightFlow 自动驾驶状态"""
+    try:
+        response = requests.get(
+            f"{SIGHTFLOW_API_URL}/skill/autopilot",
+            timeout=5
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('enabled', True)
+        return True  # 默认启用
+    except Exception as e:
+        print(f"[WeChatAgent] 检查自动驾驶状态失败: {e}", flush=True)
+        return True  # 出错时默认启用
+
+
+def send_log_to_sightflow(log_type: str, content: str, contact: str = None):
+    """发送日志到 SightFlow UI"""
+    try:
+        log_entry = {
+            "type": log_type,
+            "content": content,
+            "timestamp": int(time.time() * 1000)
+        }
+        if contact:
+            log_entry["contact"] = contact
+
+        response = requests.post(
+            f"{SIGHTFLOW_API_URL}/skill/log",
+            json=log_entry,
+            timeout=5
+        )
+        if response.status_code != 200:
+            print(f"[WeChatAgent] 发送日志失败: {response.status_code}", flush=True)
+    except Exception as e:
+        # 日志发送失败不影响主流程
+        pass
+
+
 class WeChatAgent:
     """微信自动回复 Agent 主类"""
 
@@ -42,11 +82,13 @@ class WeChatAgent:
     def start(self):
         """启动 Agent"""
         print("[WeChatAgent] 启动中...", flush=True)
+        send_log_to_sightflow('info', 'WeChat Agent 启动中...')
 
         # 初始化映射表
         print("[WeChatAgent] 初始化联系人映射表...", flush=True)
         if not self.mapper.refresh():
             print("[WeChatAgent] 联系人映射表加载失败，退出", flush=True)
+            send_log_to_sightflow('error', '联系人映射表加载失败')
             return
 
         # 启动消息队列
@@ -55,6 +97,7 @@ class WeChatAgent:
 
         # 开始轮询
         print("[WeChatAgent] 开始轮询未读消息...", flush=True)
+        send_log_to_sightflow('info', '开始轮询未读消息')
         self._poll_loop()
 
     def _poll_loop(self):
@@ -62,6 +105,17 @@ class WeChatAgent:
         heartbeat_counter = 0
         while True:
             try:
+                # 检查自动驾驶状态
+                if not check_autopilot_enabled():
+                    # 自动驾驶禁用时，跳过处理但继续轮询
+                    heartbeat_counter += 1
+                    if heartbeat_counter >= 12:
+                        print("[WeChatAgent] 自动驾驶已禁用，等待启用...", flush=True)
+                        send_log_to_sightflow('info', '自动驾驶已禁用')
+                        heartbeat_counter = 0
+                    time.sleep(WX_POLL_INTERVAL)
+                    continue
+
                 # 获取未读会话
                 unread_sessions = self._get_unread_sessions()
 
@@ -200,16 +254,23 @@ class WeChatAgent:
 
         print(f"[WeChatAgent] 处理消息: target={target}, content={content[:20]}...", flush=True)
 
+        # 发送收到消息日志到 SightFlow
+        send_log_to_sightflow('receive', content[:50] + '...' if len(content) > 50 else content, target)
+
         # AI 生成回复
         reply = self.ai_client.generate_reply(context, target)
 
         if reply:
+            # 发送回复日志到 SightFlow
+            send_log_to_sightflow('reply', reply[:50] + '...' if len(reply) > 50 else reply, target)
+
             # 加入发送队列
             self.message_queue.enqueue(target, reply, context)
             # 记录回复时间戳
             self._last_reply_ts[username] = msg.get('timestamp', 0)
         else:
             print(f"[WeChatAgent] AI 决定不回复: {target}", flush=True)
+            send_log_to_sightflow('skip', 'AI 决定不回复', target)
 
     def _send_message(self, contact: str, message: str) -> bool:
         """调用 SightFlow API 发送消息"""
