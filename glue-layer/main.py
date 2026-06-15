@@ -3,7 +3,13 @@ import subprocess
 import json
 import time
 import requests
+import sys
 from typing import List, Optional
+
+# Windows 控制台 UTF-8 编码
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 
 from config import (
     WX_CLI_PATH, WX_POLL_INTERVAL,
@@ -24,12 +30,12 @@ class WeChatAgent:
 
     def start(self):
         """启动 Agent"""
-        print("[WeChatAgent] 启动中...")
+        print("[WeChatAgent] 启动中...", flush=True)
 
         # 初始化映射表
-        print("[WeChatAgent] 初始化联系人映射表...")
+        print("[WeChatAgent] 初始化联系人映射表...", flush=True)
         if not self.mapper.refresh():
-            print("[WeChatAgent] 联系人映射表加载失败，退出")
+            print("[WeChatAgent] 联系人映射表加载失败，退出", flush=True)
             return
 
         # 启动消息队列
@@ -37,7 +43,7 @@ class WeChatAgent:
         self.message_queue.start()
 
         # 开始轮询
-        print("[WeChatAgent] 开始轮询消息...")
+        print("[WeChatAgent] 开始轮询消息...", flush=True)
         self._poll_loop()
 
     def _poll_loop(self):
@@ -68,9 +74,10 @@ class WeChatAgent:
         """调用 wx new-messages 获取新消息"""
         try:
             result = subprocess.run(
-                [WX_CLI_PATH, 'new-messages', '--json', '--filter', 'private,group'],
+                [WX_CLI_PATH, 'new-messages', '--json'],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
                 timeout=10
             )
 
@@ -82,11 +89,16 @@ class WeChatAgent:
             messages = data.get('messages', [])
 
             # 过滤自己发送的消息（防循环）
+            # wx-cli: sender == "192" 表示自己发送
             filtered = []
             for msg in messages:
-                if msg.get('is_from_self'):
+                if msg.get('sender') == '192':
                     continue
-                if SELF_WXID and msg.get('sender_wxid') == SELF_WXID:
+                if SELF_WXID and msg.get('username') == SELF_WXID:
+                    continue
+                # 只处理私聊和群聊（过滤公众号等）
+                chat_type = msg.get('chat_type', '')
+                if chat_type not in ('private', 'group'):
                     continue
                 filtered.append(msg)
 

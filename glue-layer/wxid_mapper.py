@@ -18,32 +18,37 @@ class WxidMapper:
                 [self.wx_cli_path, 'contacts', '--json'],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
                 timeout=10
             )
 
             if result.returncode != 0:
-                print(f"[WxidMapper] wx contacts 失败: {result.stderr}")
+                print(f"[WxidMapper] wx contacts 失败: {result.stderr}", flush=True)
                 return False
 
             contacts = json.loads(result.stdout)
 
-            # 构建映射表
-            for contact in contacts.get('contacts', []):
+            # wx contacts 直接返回列表，不是 { contacts: [...] }
+            for contact in contacts:
                 username = contact.get('username', '')
                 display = contact.get('display', '') or contact.get('remark', '') or username
+
+                # 过滤企业微信客服/公众号类型（只保留正常 wxid）
+                if '@openim' in username or '@kefu' in username or '@weclaw' in username:
+                    continue
 
                 if '@chatroom' in username:
                     # 群聊
                     self._group_map[username] = display
                 else:
-                    # 私聊联系人
+                    # 私聊联系人（仅正常 wxid）
                     self._name_map[username] = display
 
-            print(f"[WxidMapper] 已加载 {len(self._name_map)} 联系人, {len(self._group_map)} 群")
+            print(f"[WxidMapper] 已加载 {len(self._name_map)} 联系人, {len(self._group_map)} 群", flush=True)
             return True
 
         except Exception as e:
-            print(f"[WxidMapper] 刷新失败: {e}")
+            print(f"[WxidMapper] 刷新失败: {e}", flush=True)
             return False
 
     def get_contact_name(self, wxid: str) -> str:
