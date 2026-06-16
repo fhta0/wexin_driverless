@@ -350,6 +350,9 @@ class WeChatAgent:
 
         print(f"[WeChatAgent] 处理消息: target={target}, content={content[:20]}...", flush=True)
 
+        # 立即更新会话时间戳，防止重复处理（即使后续处理失败）
+        self._last_reply_ts[username] = msg.get('timestamp', 0)
+
         # 发送收到消息日志到 SightFlow
         send_log_to_sightflow('receive', content[:50] + '...' if len(content) > 50 else content, target)
 
@@ -362,8 +365,6 @@ class WeChatAgent:
 
             # 加入发送队列
             self.message_queue.enqueue(target, reply, context)
-            # 记录回复时间戳
-            self._last_reply_ts[username] = msg.get('timestamp', 0)
         else:
             print(f"[WeChatAgent] AI 决定不回复: {target}", flush=True)
             send_log_to_sightflow('skip', 'AI 决定不回复', target)
