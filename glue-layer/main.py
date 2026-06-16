@@ -24,49 +24,88 @@ from message_queue import MessageQueue
 
 # 进程互斥：PID 文件路径
 PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.glue-layer.pid')
+LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.glue-layer.lock')
 
 def check_single_instance() -> bool:
-    """检查是否已有实例运行，如果没有则写入当前 PID"""
+    """检查是否已有实例运行，使用文件锁确保原子性"""
+    import msvcrt  # Windows 文件锁
+
+    lock_fd = None
     try:
+        # 尝试获取文件锁（非阻塞）
+        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
+        try:
+            # 尝试获取排他锁（非阻塞）
+            msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+        except (IOError, OSError):
+            # 无法获取锁，说明已有实例在运行
+            print(f"[WeChatAgent] 已有实例运行（文件锁被占用），退出", flush=True)
+            os.close(lock_fd)
+            return False
+
+        # 获取锁成功，检查 PID 文件
         if os.path.exists(PID_FILE):
-            with open(PID_FILE, 'r') as f:
-                old_pid = int(f.read().strip())
-
-            # 检查旧进程是否还在运行
             try:
-                # Windows: 使用 tasklist 检查进程
-                result = subprocess.run(
-                    ['tasklist', '/FI', f'PID eq {old_pid}', '/NH'],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if old_pid in result.stdout:
-                    print(f"[WeChatAgent] 已有实例运行 (PID: {old_pid})，退出", flush=True)
-                    return False
-            except:
-                pass
+                with open(PID_FILE, 'r') as f:
+                    old_pid = int(f.read().strip())
 
-            # 旧进程已不在，删除旧 PID 文件
-            print(f"[WeChatAgent] 旧实例已不存在，清理 PID 文件", flush=True)
-            os.remove(PID_FILE)
+                # 检查旧进程是否还在运行
+                try:
+                    result = subprocess.run(
+                        ['tasklist', '/FI', f'PID eq {old_pid}', '/NH'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if str(old_pid) in result.stdout:
+                        print(f"[WeChatAgent] 已有实例运行 (PID: {old_pid})，退出", flush=True)
+                        # 释放锁并关闭文件
+                        try:
+                            msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+                        except:
+                            pass
+                        os.close(lock_fd)
+                        return False
+                except:
+                    pass
+
+                # 旧进程已不在，删除旧 PID 文件
+                print(f"[WeChatAgent] 旧实例已不存在，清理 PID 文件", flush=True)
+                os.remove(PID_FILE)
+            except (ValueError, IOError):
+                # PID 文件格式错误，删除它
+                try:
+                    os.remove(PID_FILE)
+                except:
+                    pass
 
         # 写入当前 PID
         with open(PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
         print(f"[WeChatAgent] 进程互斥检查通过 (PID: {os.getpid()})", flush=True)
+
+        # 注意：不释放锁，保持锁直到进程退出
+        # lock_fd 会在进程退出时自动关闭并释放锁
         return True
 
     except Exception as e:
         print(f"[WeChatAgent] 进程互锁检查失败: {e}", flush=True)
         # 出错时允许继续运行（但不写 PID 文件）
+        if lock_fd:
+            try:
+                os.close(lock_fd)
+            except:
+                pass
         return True
 
 def cleanup_pid_file():
-    """清理 PID 文件"""
+    """清理 PID 文件和锁文件"""
+    import msvcrt
     try:
         if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
     except:
         pass
 
