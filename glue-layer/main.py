@@ -176,10 +176,19 @@ class WeChatAgent:
                 unread_sessions = self._get_unread_sessions()
 
                 if unread_sessions:
-                    print(f"[WeChatAgent] 发现 {len(unread_sessions)} 个未读会话", flush=True)
-
+                    # 过滤掉已处理的会话（检查时间戳）
+                    new_sessions = []
                     for session in unread_sessions:
-                        self._process_unread_session(session)
+                        username = session.get('username', '')
+                        session_timestamp = session.get('timestamp', 0)
+                        last_reply_ts = self._last_reply_ts.get(username, 0)
+                        if session_timestamp > last_reply_ts:
+                            new_sessions.append(session)
+
+                    if new_sessions:
+                        print(f"[WeChatAgent] 发现 {len(new_sessions)} 个未读会话", flush=True)
+                        for session in new_sessions:
+                            self._process_unread_session(session)
 
                 # 心跳日志（每 12 次轮询约 60 秒）
                 heartbeat_counter += 1
