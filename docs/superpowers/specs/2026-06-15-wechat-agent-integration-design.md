@@ -118,28 +118,36 @@ for msg in new_messages:
 
 wx-cli 返回的 `sender_wxid` 是底层 wxid，需要翻译为可见的备注名/昵称。
 
+**搜索策略**：
+- 微信搜索框只能搜索：备注名、微信号、昵称
+- wxid（如 `wxid_xxx`）**不能被搜索**
+- wx-cli 返回的数据中没有微信号字段
+- 因此只能用备注名/昵称作为搜索目标
+
 **私聊场景**：
-- `sender_wxid` → 联系人备注名
-- SightFlow 搜索该联系人
+- `chat_name`（备注名）→ SightFlow 搜索目标
+- 所有私聊消息都回复
 
 **群聊场景**：
-- `room_id`（如 `xxx@chatroom`）→ 群名（SightFlow 搜索目标）
-- `sender_wxid` → 群成员名（作为 AI 回复的上下文）
+- `chat_name`（群名）→ SightFlow 搜索目标
+- 只有被 @ 的消息才回复
+- 其他群消息只监控（打印日志）
 
+**群消息 @ 检测**：
 ```python
-def translate_and_route(msg):
-    if msg['chat_type'] == 'private':
-        target = name_map.get(msg['sender_wxid']) or msg['sender_wxid']
-        context = f"来自 {target} 的私聊消息"
-    
-    elif msg['chat_type'] == 'group':
-        group_name = name_map.get(msg['room_id']) or msg['room_id']
-        member_name = name_map.get(msg['sender_wxid']) or msg['sender_wxid']
-        target = group_name  # SightFlow 搜索群
-        context = f"群【{group_name}】中 {member_name} 说：{msg['content']}"
-    
-    return target, context
+def _is_mentioned(self, content: str) -> bool:
+    """检测群消息中是否 @ 了自己"""
+    names = [name.strip() for name in SELF_NAMES.split(',') if name.strip()]
+    for name in names:
+        if f"@{name}" in content:
+            return True
+    return False
 ```
+
+配置自己的名字（`SELF_NAMES`）：
+- 支持多个名字，逗号分隔
+- 如 `SELF_NAMES=付海涛,老付,海涛`
+- 未配置时默认回复所有群消息
 
 ### 步骤 3：消息队列 + 排他锁
 

@@ -18,3 +18,7 @@ AI_MODEL = os.getenv('AI_MODEL', 'gpt-4o-mini')
 
 # 自己的微信 ID（用于防循环过滤）
 SELF_WXID = os.getenv('SELF_WXID', '')
+
+# 自己的群昵称/备注名（用于检测群聊中是否被 @）
+# 格式可以是多个名字，逗号分隔，如 "付海涛,老付,海涛"
+SELF_NAMES = os.getenv('SELF_NAMES', '')

@@ -185,6 +185,8 @@ class WeChatAgent:
                 heartbeat_counter += 1
                 if heartbeat_counter >= 12:
                     print(f"[WeChatAgent] 轮询中... (已处理 {len(self._processed_keys)} 条消息)", flush=True)
+                    # 发送心跳日志到 SightFlow，确保 UI 显示"已连接"
+                    send_log_to_sightflow('heartbeat', f'已处理 {len(self._processed_keys)} 条消息')
                     heartbeat_counter = 0
 
                 # 等待下一次轮询
@@ -303,17 +305,42 @@ class WeChatAgent:
         chat_type = session.get('chat_type', 'private')
         username = session.get('username', '')
         chat_name = session.get('chat', '')
+        content = msg.get('content', '')
 
         # target: SightFlow 搜索目标
+        # 微信搜索框只能搜索：备注名、微信号、昵称
+        # wxid（如 wxid_xxx）不能被搜索，只能用备注名/昵称
+        # 群聊搜索可以用群名（群名是唯一的）
         if chat_type == 'private':
-            target = chat_name  # 私聊直接用会话名（联系人备注名）
+            target = chat_name  # 私聊用备注名/昵称
+            # 私聊：所有消息都回复
+            should_reply = True
+            context = f"来自 {target} 的私聊消息：{content}"
         elif chat_type == 'group':
-            target = chat_name  # 群聊用群名
+            # 群聊：room_id 可能是群名或 xxx@chatroom 格式
+            # 微信搜索群时，群名更可靠（群名唯一）
+            if '@chatroom' in username:
+                target = chat_name  # 用群名搜索
+            else:
+                target = chat_name
+
+            # 群聊：只有被 @ 才回复，否则只监控
+            should_reply = self._is_mentioned(content)
+            sender = msg.get('sender', '') or session.get('chat', '')
+
+            if should_reply:
+                context = f"群【{target}】中 {sender} @你：{content}"
+            else:
+                # 只监控，不回复
+                print(f"[WeChatAgent] 群消息监控: 群={target}, 发送者={sender}, 内容={content[:30]}...", flush=True)
+                send_log_to_sightflow('monitor', f'{sender}: {content[:50]}', target)
+                # 更新时间戳防止重复处理
+                self._last_reply_ts[username] = msg.get('timestamp', 0)
+                return  # 不回复，直接返回
         else:
             target = chat_name
-
-        content = msg.get('content', '')
-        context = f"来自 {target} 的消息：{content}"
+            should_reply = True
+            context = f"来自 {target} 的消息：{content}"
 
         print(f"[WeChatAgent] 处理消息: target={target}, content={content[:20]}...", flush=True)
 
@@ -334,6 +361,25 @@ class WeChatAgent:
         else:
             print(f"[WeChatAgent] AI 决定不回复: {target}", flush=True)
             send_log_to_sightflow('skip', 'AI 决定不回复', target)
+
+    def _is_mentioned(self, content: str) -> bool:
+        """检测群消息中是否 @ 了自己"""
+        from config import SELF_NAMES
+
+        if not SELF_NAMES:
+            # 未配置自己的名字，默认回复所有群消息
+            return True
+
+        # 检测消息内容中是否包含 @自己的名字
+        # 支持多个名字配置（逗号分隔）
+        names = [name.strip() for name in SELF_NAMES.split(',') if name.strip()]
+
+        for name in names:
+            # 微信群聊 @ 格式：@昵称 或 @群名片
+            if f"@{name}" in content:
+                return True
+
+        return False
 
     def _send_message(self, contact: str, message: str) -> bool:
         """调用 SightFlow API 发送消息"""
