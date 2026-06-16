@@ -40,6 +40,68 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## 关键实现细节
+
+### 进程互斥（防止多实例）
+
+粘合层使用 PID 文件确保只有一个实例运行：
+
+```python
+PID_FILE = '.glue-layer.pid'
+
+def check_single_instance():
+    if os.path.exists(PID_FILE):
+        old_pid = int(open(PID_FILE).read())
+        # 检查进程是否存活
+        if is_process_running(old_pid):
+            print(f"已有实例运行 (PID: {old_pid})")
+            return False
+        os.remove(PID_FILE)
+    
+    # 写入当前 PID
+    open(PID_FILE, 'w').write(str(os.getpid()))
+    return True
+```
+
+### 消息去重策略
+
+使用复合 key 防止重复处理同一条消息：
+
+```python
+def _make_msg_key(msg):
+    ts = msg.get('timestamp', 0)
+    sender = msg.get('sender', '')
+    content_hash = hash(msg.get('content', '')[:50])
+    return f"{ts}:{sender}:{content_hash}"
+
+_processed_keys: Set[str] = set()
+```
+
+### 会话时间戳跟踪
+
+即使会话全是自己发的消息，也要更新 `_last_reply_ts`，防止重复检查：
+
+```python
+def _process_unread_session(session):
+    session_timestamp = session.get('timestamp', 0)
+    
+    # 防止重复处理已检查过的会话
+    if session_timestamp <= self._last_reply_ts.get(username, 0):
+        return
+    
+    found_other_message = False
+    for msg in reversed(messages):
+        if msg['sender'] == '192':  # 自己发的消息
+            continue
+        # 处理对方消息...
+        found_other_message = True
+        break
+    
+    # 无论是否找到对方消息，都更新时间戳
+    if not found_other_message:
+        self._last_reply_ts[username] = session_timestamp
+```
+
 ## 数据流
 
 ### 步骤 1：防循环过滤

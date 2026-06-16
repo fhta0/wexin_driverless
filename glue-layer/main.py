@@ -4,6 +4,7 @@ import json
 import time
 import requests
 import sys
+import os
 from typing import List, Optional, Set, Dict
 from collections import deque
 
@@ -20,6 +21,54 @@ from config import (
 from wxid_mapper import WxidMapper
 from ai_client import AIClient
 from message_queue import MessageQueue
+
+# 进程互斥：PID 文件路径
+PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.glue-layer.pid')
+
+def check_single_instance() -> bool:
+    """检查是否已有实例运行，如果没有则写入当前 PID"""
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE, 'r') as f:
+                old_pid = int(f.read().strip())
+
+            # 检查旧进程是否还在运行
+            try:
+                # Windows: 使用 tasklist 检查进程
+                result = subprocess.run(
+                    ['tasklist', '/FI', f'PID eq {old_pid}', '/NH'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if old_pid in result.stdout:
+                    print(f"[WeChatAgent] 已有实例运行 (PID: {old_pid})，退出", flush=True)
+                    return False
+            except:
+                pass
+
+            # 旧进程已不在，删除旧 PID 文件
+            print(f"[WeChatAgent] 旧实例已不存在，清理 PID 文件", flush=True)
+            os.remove(PID_FILE)
+
+        # 写入当前 PID
+        with open(PID_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        print(f"[WeChatAgent] 进程互斥检查通过 (PID: {os.getpid()})", flush=True)
+        return True
+
+    except Exception as e:
+        print(f"[WeChatAgent] 进程互锁检查失败: {e}", flush=True)
+        # 出错时允许继续运行（但不写 PID 文件）
+        return True
+
+def cleanup_pid_file():
+    """清理 PID 文件"""
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+    except:
+        pass
 
 # 防刷屏配置
 MAX_MESSAGES_PER_MINUTE = 3  # 每分钟最多回复 3 条
@@ -72,12 +121,19 @@ class WeChatAgent:
         self.mapper = WxidMapper(WX_CLI_PATH)
         self.ai_client = AIClient()
         self.message_queue: Optional[MessageQueue] = None
-        # 已处理消息 ID 缓存（防重复）
-        self._processed_ids: Set[int] = set()
+        # 已处理消息标识缓存（防重复）- 使用 时间戳+发送者+内容hash
+        self._processed_keys: Set[str] = set()
         # 发送时间记录（防刷屏）
         self._send_times: deque = deque(maxlen=MAX_MESSAGES_PER_MINUTE)
         # 已回复会话时间戳（避免重复回复同一会话的旧消息）
         self._last_reply_ts: Dict[str, int] = {}
+
+    def _make_msg_key(self, msg: dict) -> str:
+        """生成消息唯一标识：时间戳+发送者+内容hash"""
+        ts = msg.get('timestamp', 0)
+        sender = msg.get('sender', '')
+        content = msg.get('content', '')[:50]
+        return f"{ts}:{sender}:{hash(content)}"
 
     def start(self):
         """启动 Agent"""
@@ -128,7 +184,7 @@ class WeChatAgent:
                 # 心跳日志（每 12 次轮询约 60 秒）
                 heartbeat_counter += 1
                 if heartbeat_counter >= 12:
-                    print(f"[WeChatAgent] 轮询中... (已处理 {len(self._processed_ids)} 条消息)", flush=True)
+                    print(f"[WeChatAgent] 轮询中... (已处理 {len(self._processed_keys)} 条消息)", flush=True)
                     heartbeat_counter = 0
 
                 # 等待下一次轮询
@@ -169,11 +225,11 @@ class WeChatAgent:
         """处理单个未读会话"""
         username = session.get('username', '')
         unread_count = session.get('unread', 0)
-        last_timestamp = session.get('timestamp', 0)
+        session_timestamp = session.get('timestamp', 0)
 
         # 防止重复处理同一会话（如果时间戳没变化）
         last_reply_ts = self._last_reply_ts.get(username, 0)
-        if last_timestamp <= last_reply_ts:
+        if session_timestamp <= last_reply_ts:
             return
 
         print(f"[WeChatAgent] 处理未读会话: {session.get('chat')}, 未读={unread_count}", flush=True)
@@ -182,25 +238,32 @@ class WeChatAgent:
         messages = self._get_recent_messages(username, unread_count)
 
         # 找到对方发送的最新消息（未回复的）
+        found_other_message = False
         for msg in reversed(messages):  # 从最新到最旧
             sender = msg.get('sender', '')
-            local_id = msg.get('local_id')
+            msg_key = self._make_msg_key(msg)
 
             # 跳过已处理的消息
-            if local_id and local_id in self._processed_ids:
+            if msg_key in self._processed_keys:
                 continue
 
             # 跳过自己发送的消息（sender == "192"）
             if sender == '192':
-                if local_id:
-                    self._processed_ids.add(local_id)
+                self._processed_keys.add(msg_key)
                 continue
 
             # 找到对方发送的最新未处理消息
             if sender == '' or sender != '192':
-                self._processed_ids.add(local_id)
+                self._processed_keys.add(msg_key)
                 self._process_message(msg, session)
+                found_other_message = True
                 break  # 只处理一条最新消息
+
+        # 无论是否找到对方消息，都更新会话时间戳（防止重复检查）
+        # 如果找到对方消息，_process_message 内部会更新 _last_reply_ts
+        # 如果没找到（全是自己发的消息），这里更新防止下次重复检查
+        if not found_other_message:
+            self._last_reply_ts[username] = session_timestamp
 
     def _get_recent_messages(self, username: str, limit: int) -> List[dict]:
         """获取会话的最近消息"""
@@ -304,8 +367,15 @@ class WeChatAgent:
             return False
 
 def main():
-    agent = WeChatAgent()
-    agent.start()
+    # 进程互锁检查
+    if not check_single_instance():
+        sys.exit(1)
+
+    try:
+        agent = WeChatAgent()
+        agent.start()
+    finally:
+        cleanup_pid_file()
 
 if __name__ == '__main__':
     main()
