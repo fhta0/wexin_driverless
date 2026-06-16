@@ -1,7 +1,10 @@
 # glue-layer/wxid_mapper.py
 import subprocess
 import json
+import re
 from typing import Dict
+from config import GROUP_NAMES
+
 
 class WxidMapper:
     """wxid → 备注名/昵称 映射器"""
@@ -10,6 +13,13 @@ class WxidMapper:
         self.wx_cli_path = wx_cli_path
         self._name_map: Dict[str, str] = {}  # wxid → display_name
         self._group_map: Dict[str, str] = {}  # room_id → group_name
+
+        # 加载手动配置的群名映射（优先级最高）
+        if GROUP_NAMES:
+            for mapping in GROUP_NAMES.split(','):
+                if ':' in mapping:
+                    room_id, group_name = mapping.strip().split(':', 1)
+                    self._group_map[room_id.strip()] = group_name.strip()
 
     def refresh(self) -> bool:
         """从 wx contacts 和 wx sessions 刷新映射表"""
@@ -34,7 +44,9 @@ class WxidMapper:
                         continue
 
                     if '@chatroom' in username:
-                        self._group_map[username] = display
+                        # 只有当手动配置中没有这个群时才覆盖
+                        if username not in self._group_map:
+                            self._group_map[username] = display
                     else:
                         self._name_map[username] = display
 
@@ -55,16 +67,68 @@ class WxidMapper:
                     chat_name = session.get('chat', '')
                     chat_type = session.get('chat_type', '')
 
-                    if chat_type == 'group' and '@chatroom' in username and chat_name:
-                        # 用 session 中的 chat 作为群名（比 contacts 更准确）
-                        self._group_map[username] = chat_name
+                    if chat_type == 'group' and '@chatroom' in username:
+                        # 只有当手动配置中没有这个群时才尝试从其他来源获取群名
+                        if username not in self._group_map:
+                            # 如果 sessions 返回的 chat 不是 room_id，使用它作为群名
+                            if chat_name and '@chatroom' not in chat_name:
+                                self._group_map[username] = chat_name
+                            else:
+                                # 尝试从历史消息中提取群名
+                                group_name = self._extract_group_name_from_history(username)
+                                if group_name:
+                                    self._group_map[username] = group_name
+                                else:
+                                    # 兜底：使用 room_id
+                                    self._group_map[username] = username
 
             print(f"[WxidMapper] 已加载 {len(self._name_map)} 联系人, {len(self._group_map)} 群", flush=True)
+            print(f"[WxidMapper] 群映射: {json.dumps(self._group_map, ensure_ascii=False)}", flush=True)
             return True
 
         except Exception as e:
             print(f"[WxidMapper] 刷新失败: {e}", flush=True)
             return False
+
+    def _extract_group_name_from_history(self, room_id: str) -> str:
+        """从群聊历史消息中提取群名（从系统消息中解析）"""
+        try:
+            result = subprocess.run(
+                [self.wx_cli_path, 'history', room_id, '--json', '-n', '50'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                timeout=15
+            )
+
+            if result.returncode != 0:
+                return None
+
+            data = json.loads(result.stdout)
+            messages = data.get('messages', [])
+
+            # 从后往前查找系统消息（最新的群名）
+            for msg in reversed(messages):
+                if msg.get('type') == '系统':
+                    content = msg.get('content', '')
+                    # 匹配 "修改群名为"xxx""（支持中文引号 "" 和英文引号 ""）
+                    match = re.search(r'修改群名为[""\"](.*?)[""\"]', content)
+                    if match:
+                        return match.group(1)
+                    # 兜底：不带引号的格式
+                    match = re.search(r'修改群名为(\S+)', content)
+                    if match:
+                        # 去除可能的引号
+                        name = match.group(1)
+                        # 去除首尾的中文/英文引号
+                        name = name.strip('"“”')
+                        return name
+
+            return None
+
+        except Exception as e:
+            print(f"[WxidMapper] 提取群名失败: {e}", flush=True)
+            return None
 
     def get_contact_name(self, wxid: str) -> str:
         """获取联系人备注名"""

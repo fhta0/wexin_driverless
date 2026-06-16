@@ -319,11 +319,14 @@ class WeChatAgent:
         elif chat_type == 'group':
             # 群聊：翻译 room_id 为群名
             # 微信搜索群时，群名更可靠（群名唯一）
+            print(f"[DEBUG] 群聊处理: username={username}, chat_name={chat_name}", flush=True)
             if '@chatroom' in username:
                 target = self.mapper.get_group_name(username)  # 翻译 room_id 为群名
+                print(f"[DEBUG] 翻译结果: target={target}", flush=True)
                 # 如果翻译失败（返回原值），尝试用 chat_name
                 if target == username:
                     target = chat_name if chat_name and '@chatroom' not in chat_name else username
+                    print(f"[DEBUG] 翻译失败，使用 chat_name: target={target}", flush=True)
             else:
                 target = chat_name
 
