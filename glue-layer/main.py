@@ -317,10 +317,13 @@ class WeChatAgent:
             should_reply = True
             context = f"来自 {target} 的私聊消息：{content}"
         elif chat_type == 'group':
-            # 群聊：room_id 可能是群名或 xxx@chatroom 格式
+            # 群聊：翻译 room_id 为群名
             # 微信搜索群时，群名更可靠（群名唯一）
             if '@chatroom' in username:
-                target = chat_name  # 用群名搜索
+                target = self.mapper.get_group_name(username)  # 翻译 room_id 为群名
+                # 如果翻译失败（返回原值），尝试用 chat_name
+                if target == username:
+                    target = chat_name if chat_name and '@chatroom' not in chat_name else username
             else:
                 target = chat_name
 
