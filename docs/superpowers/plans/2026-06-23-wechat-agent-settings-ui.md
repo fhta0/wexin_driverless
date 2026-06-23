@@ -155,7 +155,7 @@ class TestConfigValidator:
 
 ```bash
 cd D:/code/wexin_driverless/glue-layer
-D:/miniconda/envs/py3.12/python.exe -m pytest tests/test_config_model.py -v
+D:/miniconda/envs/py3.12/python.exe -m pytest test_config_model.py -v
 ```
 
 Expected: FAIL — `config_model` 模块不存在
@@ -324,7 +324,7 @@ class ConfigValidator:
 
 ```bash
 cd D:/code/wexin_driverless/glue-layer
-D:/miniconda/envs/py3.12/python.exe -m pytest tests/test_config_model.py -v
+D:/miniconda/envs/py3.12/python.exe -m pytest test_config_model.py -v
 ```
 
 Expected: 7 passed
@@ -342,7 +342,7 @@ pywin32; sys_platform == 'win32'
 - [ ] **Step 6: 提交**
 
 ```bash
-git add glue-layer/config_model.py glue-layer/tests/test_config_model.py glue-layer/requirements.txt
+git add glue-layer/config_model.py glue-layer/test_config_model.py glue-layer/requirements.txt
 git commit -m "feat: 添加配置模型和校验器 (config_model.py)"
 ```
 
@@ -481,7 +481,7 @@ class TestConfigWatcher:
 
 ```bash
 cd D:/code/wexin_driverless/glue-layer
-D:/miniconda/envs/py3.12/python.exe -m pytest tests/test_config_watcher.py -v
+D:/miniconda/envs/py3.12/python.exe -m pytest test_config_watcher.py -v
 ```
 
 Expected: FAIL — `config_watcher` 模块不存在
@@ -557,7 +557,7 @@ class ConfigWatcher:
 
 ```bash
 cd D:/code/wexin_driverless/glue-layer
-D:/miniconda/envs/py3.12/python.exe -m pytest tests/test_config_watcher.py -v
+D:/miniconda/envs/py3.12/python.exe -m pytest test_config_watcher.py -v
 ```
 
 Expected: 7 passed
@@ -565,7 +565,7 @@ Expected: 7 passed
 - [ ] **Step 5: 提交**
 
 ```bash
-git add glue-layer/config_watcher.py glue-layer/tests/test_config_watcher.py
+git add glue-layer/config_watcher.py glue-layer/test_config_watcher.py
 git commit -m "feat: 添加 ConfigWatcher 热重载机制"
 ```
 
@@ -776,14 +776,14 @@ class WeChatAgent:
             )
 ```
 
-- [ ] **Step 7: 运行验证**
+- [ ] **Step 8: 运行验证**
 
 ```bash
 cd D:/code/wexin_driverless/glue-layer
 D:/miniconda/envs/py3.12/python.exe -c "from main import WeChatAgent; print('Import OK')"
 ```
 
-- [ ] **Step 8: 提交**
+- [ ] **Step 9: 提交**
 
 ```bash
 git add glue-layer/main.py
@@ -1159,6 +1159,10 @@ export function WechatAgentSettings(): React.JSX.Element {
     const result = await window.electron?.invoke('wechat-agent:detectWxid', config.advanced.wx_cli_path)
     if (result?.ok && result.wxid) {
       setConfig(prev => ({ ...prev, identity: { ...prev.identity, wxid: result.wxid } }))
+    } else if (!result?.ok) {
+      alert('自动检测失败，请确认 wx-cli 已升级到支持 whoami 的版本')
+    } else if (!result.wxid) {
+      alert('未能检测到 wxid，请手动输入')
     }
   }
 
@@ -1313,8 +1317,9 @@ function TagInput({ tags, onChange }: { tags: string[]; onChange: (tags: string[
       e.preventDefault()
       if (!tags.includes(input.trim())) {
         onChange([...tags, input.trim()])
+        setInput('')  // 成功添加才清空
       }
-      setInput('')
+      // 重复时保留 input，让用户看到没被添加并自行修改
     }
   }
 
@@ -1441,8 +1446,13 @@ git commit -m "feat: 添加微信 Agent 设置标签页和 TagInput 组件"
 
 **Files:**
 - Modify: `sightflow-desktop-agent/src/renderer/src/App.tsx`
+- Modify: `sightflow-desktop-agent/src/renderer/src/WechatAgentSettings.tsx`
 
-- [ ] **Step 1: 在 ControlPanel 中添加 alert 监听**
+**架构说明：** SightFlow 的设置页是独立的 BrowserWindow（`?window=settings`），和主窗口的 ControlPanel 不在同一个渲染进程。因此需要在**两个地方**都监听 alert 事件：
+- 主窗口（ControlPanel）— 用户日常使用时看到
+- 设置窗口（WechatAgentSettings）— 用户改配置时看到
+
+- [ ] **Step 1: 在 ControlPanel 中添加 alert 监听（主窗口）**
 
 在 `ControlPanel` 组件中添加：
 
@@ -1500,7 +1510,39 @@ function ControlPanel() {
   )
 ```
 
-- [ ] **Step 2: 提交**
+- [ ] **Step 2: 在 WechatAgentSettings 中添加 alert 监听（设置窗口）**
+
+在 `WechatAgentSettings.tsx` 中添加相同的 alert 监听逻辑：
+
+```tsx
+export function WechatAgentSettings(): React.JSX.Element {
+  const [currentAlert, setCurrentAlert] = useState<AlertData | null>(null)
+  // ... 其他 state ...
+
+  useEffect(() => {
+    // 监听 alert 事件（设置窗口也需要，因为和主窗口是独立的 BrowserWindow）
+    const unsubAlert = window.electron?.on('wechat-agent:alert-pushed', (alert: AlertData) => {
+      setCurrentAlert(alert)
+    })
+    return () => { unsubAlert?.() }
+  }, [])
+
+  // ... 在 JSX 的 settings-page div 最顶部插入 banner:
+  return (
+    <div className="settings-page slide-up">
+      {currentAlert && (
+        <div className={`alert-banner ${currentAlert.severity}`}>
+          <span>{currentAlert.message}</span>
+          <button className="close-btn" onClick={() => setCurrentAlert(null)}>×</button>
+        </div>
+      )}
+      {/* ... 其余内容 ... */}
+    </div>
+  )
+}
+```
+
+- [ ] **Step 3: 提交**
 
 ```bash
 git add sightflow-desktop-agent/src/renderer/src/App.tsx
