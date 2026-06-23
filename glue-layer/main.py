@@ -342,8 +342,8 @@ class WeChatAgent:
         if timestamp > 0 and timestamp < self._start_timestamp:
             return
 
-        # 使用配置快照中的 wxid 判断自己发送的消息
-        if sender == config.identity.wxid:
+        # 跳过自己发送的消息（wxid 匹配，或 sender == '192' 即微信内部系统账号回显）
+        if sender == config.identity.wxid or sender == '192':
             return
 
         # 跳过系统消息

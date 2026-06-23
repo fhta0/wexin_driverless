@@ -1,17 +1,16 @@
 # glue-layer/ai_client.py
 from typing import Optional
 from openai import OpenAI
-from config import AI_API_KEY, AI_API_URL, AI_MODEL
 
 class AIClient:
     """AI API 调用客户端"""
 
-    def __init__(self):
+    def __init__(self, api_key: str, api_url: str = "https://api.openai.com/v1", model: str = "gpt-4o-mini"):
         self.client = OpenAI(
-            api_key=AI_API_KEY,
-            base_url=AI_API_URL
+            api_key=api_key,
+            base_url=api_url
         )
-        self.model = AI_MODEL
+        self.model = model
 
         # 系统提示词
         self.system_prompt = """你是一个微信自动回复助手。
