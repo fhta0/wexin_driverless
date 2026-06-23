@@ -3,7 +3,6 @@ import subprocess
 import json
 import re
 from typing import Dict
-from config import GROUP_NAMES
 
 
 class WxidMapper:
@@ -13,13 +12,6 @@ class WxidMapper:
         self.wx_cli_path = wx_cli_path
         self._name_map: Dict[str, str] = {}  # wxid → display_name
         self._group_map: Dict[str, str] = {}  # room_id → group_name
-
-        # 加载手动配置的群名映射（优先级最高）
-        if GROUP_NAMES:
-            for mapping in GROUP_NAMES.split(','):
-                if ':' in mapping:
-                    room_id, group_name = mapping.strip().split(':', 1)
-                    self._group_map[room_id.strip()] = group_name.strip()
 
     def refresh(self) -> bool:
         """从 wx contacts 和 wx sessions 刷新映射表"""
