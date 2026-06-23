@@ -369,6 +369,7 @@ class ConfigWatcher:
    - SightFlow Skill Server 新增 `POST /skill/alert` 端点
    - 收到 alert 后：顶部红色 banner + 系统通知（Notification API）
    - **去重逻辑：** 按 `code` 去重，相同 code 的 alert 在 5 分钟内只展示一次（或直到用户手动关闭）
+   - **重启行为：** SightFlow 重启后去重 Map 清空，会重新显示未解决的 alert（预期行为，确保用户注意到）
 
 ### glue-layer 端（Python）
 
