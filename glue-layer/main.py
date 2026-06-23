@@ -24,19 +24,64 @@ from message_queue import MessageQueue
 PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.glue-layer.pid')
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.glue-layer.lock')
 
+
+# 平台抽象：文件锁 + 进程存活检测
+if sys.platform == 'win32':
+    import msvcrt
+
+    def _try_lock(fd: int) -> bool:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except (IOError, OSError):
+            return False
+
+    def _unlock(fd: int) -> None:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except Exception:
+            pass
+
+    def _process_alive(pid: int) -> bool:
+        try:
+            result = subprocess.run(
+                ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+                capture_output=True, text=True, timeout=5
+            )
+            return str(pid) in result.stdout
+        except Exception:
+            return False
+else:
+    import fcntl
+
+    def _try_lock(fd: int) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (IOError, OSError):
+            return False
+
+    def _unlock(fd: int) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+
+    def _process_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
 def check_single_instance() -> bool:
     """检查是否已有实例运行，使用文件锁确保原子性"""
-    import msvcrt  # Windows 文件锁
-
     lock_fd = None
     try:
         # 尝试获取文件锁（非阻塞）
         lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
-        try:
-            # 尝试获取排他锁（非阻塞）
-            msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
-        except (IOError, OSError):
-            # 无法获取锁，说明已有实例在运行
+        if not _try_lock(lock_fd):
             print(f"[WeChatAgent] 已有实例运行（文件锁被占用），退出", flush=True)
             os.close(lock_fd)
             return False
@@ -47,34 +92,19 @@ def check_single_instance() -> bool:
                 with open(PID_FILE, 'r') as f:
                     old_pid = int(f.read().strip())
 
-                # 检查旧进程是否还在运行
-                try:
-                    result = subprocess.run(
-                        ['tasklist', '/FI', f'PID eq {old_pid}', '/NH'],
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
-                    if str(old_pid) in result.stdout:
-                        print(f"[WeChatAgent] 已有实例运行 (PID: {old_pid})，退出", flush=True)
-                        # 释放锁并关闭文件
-                        try:
-                            msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
-                        except:
-                            pass
-                        os.close(lock_fd)
-                        return False
-                except:
-                    pass
+                if _process_alive(old_pid):
+                    print(f"[WeChatAgent] 已有实例运行 (PID: {old_pid})，退出", flush=True)
+                    _unlock(lock_fd)
+                    os.close(lock_fd)
+                    return False
 
                 # 旧进程已不在，删除旧 PID 文件
                 print(f"[WeChatAgent] 旧实例已不存在，清理 PID 文件", flush=True)
                 os.remove(PID_FILE)
             except (ValueError, IOError):
-                # PID 文件格式错误，删除它
                 try:
                     os.remove(PID_FILE)
-                except:
+                except Exception:
                     pass
 
         # 写入当前 PID
@@ -88,23 +118,22 @@ def check_single_instance() -> bool:
 
     except Exception as e:
         print(f"[WeChatAgent] 进程互锁检查失败: {e}", flush=True)
-        # 出错时允许继续运行（但不写 PID 文件）
         if lock_fd:
             try:
                 os.close(lock_fd)
-            except:
+            except Exception:
                 pass
         return True
 
+
 def cleanup_pid_file():
     """清理 PID 文件和锁文件"""
-    import msvcrt
     try:
         if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
         if os.path.exists(LOCK_FILE):
             os.remove(LOCK_FILE)
-    except:
+    except Exception:
         pass
 
 # 防刷屏配置

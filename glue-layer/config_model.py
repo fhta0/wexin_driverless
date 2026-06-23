@@ -110,8 +110,9 @@ class ConfigValidator:
         if not wxid:
             raise ValueError("identity.wxid cannot be empty")
         names = identity_data.get('names', [])
-        if not isinstance(names, list) or len(names) == 0:
-            raise ValueError("identity.names must be a non-empty array (at least one nickname)")
+        if not isinstance(names, list):
+            raise ValueError("identity.names must be an array")
+        # names 可以为空（空数组表示不检测 @提及，群聊中始终回复）
         identity = IdentityConfig(wxid=wxid, names=names)
 
         # Groups 校验
