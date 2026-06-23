@@ -24,8 +24,16 @@ python main.py
 
 ## 流程
 
-1. 每 5 秒调用 `wx new-messages --json --filter private,group`
-2. 过滤自己发送的消息（防循环）
+1. 每 10 秒调用 `wx new-messages --json --filter private,group`
+2. 过滤自己发送消息（防循环）
 3. 翻译 wxid → 备注名/群名
-4. 调用 AI 生成回复
-5. 通过 SightFlow API 发送消息（串行化）
+4. 调用 SightFlow `/skill/generate-reply` API 生成回复（AI 配置在 SightFlow 统一管理）
+5. 通过 SightFlow `/skill/send-message` API 发送消息（串行化）
+
+## 配置
+
+配置通过 SightFlow UI 管理，存储在 `%APPDATA%\WeChatAgent\config.json`：
+
+- `identity`: 微信 ID 和昵称（用于识别自己和 @提及）
+- `groups.monitor`: 监控的群聊列表
+- `advanced.wx_cli_path`: wx-cli 路径
