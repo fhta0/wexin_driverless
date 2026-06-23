@@ -158,8 +158,9 @@ SightFlow (Electron)                glue-layer (Python)
   - 微信 ID：文本框 + "自动检测"按钮（调用 `wx whoami` 或读取 wx-cli 缓存）
   - 群昵称：**Tag input** 组件（输入一个名字，按回车变成 chip，支持删除）
 - **群组选择**：多选列表，数据源是 `wx contacts --json` 过滤 `chat_type == 'group'`，带搜索过滤
+  - **验证项：** 实现前需确认 `wx contacts --json` 输出是否真有 `chat_type` 字段；若无，改用 `wx sessions --json -n 1000` 或新增 wx-cli 子命令
 - **AI 服务**：URL 文本框 + Key 密码框（带显示/隐藏切换）+ Model 文本框
-- **高级设置**：折叠区域，默认收起，wx-cli 路径输入框
+- **高级设置**：折叠区域，默认收起，wx-cli 路径输入框 + "打开配置文件夹"按钮（`shell.openPath()`）
 - **保存按钮**：写入加密 JSON 文件，显示"已保存 ✓"提示
 
 ## 配置文件格式
@@ -308,9 +309,31 @@ class ConfigWatcher:
 - SightFlow 收到 alert 后：顶部红色 banner + 系统通知（Notification API）
 - 确保用户即使没开日志面板也能看到
 
+**`/skill/alert` 请求格式：**
+```json
+{
+  "severity": "critical",
+  "code": "api_key_decrypt_failed",
+  "message": "API Key 解密失败，需要重新配置",
+  "timestamp": 1719123456
+}
+```
+- `severity`: `"critical"` | `"warning"` | `"info"`
+- `code`: 错误码，便于 UI 国际化
+- `message`: 用户可读文案
+- `timestamp`: Unix 时间戳
+
+**IPC 事件推送（SightFlow 内部）：**
+- main 进程收到 `/skill/alert` 后，用 `webContents.send('wechat-agent:alert-pushed', alertData)` 推送到 renderer
+- renderer 用 `ipcRenderer.on('wechat-agent:alert-pushed', ...)` 订阅
+- 这是 **main → renderer 事件**，不是传统的 `ipcMain.handle` 请求-响应
+
 **配置快照机制：**
-- 消息进入 `_process_message()` 时，从 `ConfigWatcher` 获取当前配置的深拷贝
+- 消息进入 `_process_message()` 时，从 `ConfigWatcher` 获取当前配置的**深拷贝**
 - 整个消息处理生命周期（AI 请求、排队、发送）都用这份快照
+- 实现：`import copy; config_snapshot = copy.deepcopy(config_watcher.get_config())`
+- 配置变化时，已在处理的消息不受影响，新消息用新配置
+- **单元测试：** 修改 snapshot 不影响源配置
 - 配置变化时，已在处理的消息不受影响，新消息用新配置
 
 ## 实现范围
@@ -332,7 +355,9 @@ class ConfigWatcher:
    - `wechat-agent:detectWxid` — 调用 `wx whoami` 或读取 wx-cli 缓存
    - `wechat-agent:saveConfig` — **renderer 传明文 API Key，main 进程加密后写入**
    - `wechat-agent:loadConfig` — 读取并解密配置（用于初始化 UI）
-   - `wechat-agent:receiveAlert` — 接收 glue-layer 的 `/skill/alert` 推送
+
+4. **IPC 事件（main → renderer）**
+   - `wechat-agent:alert-pushed` — main 进程推送 alert 到 renderer（事件订阅，非请求-响应）
 
 4. **配置写入逻辑**
    - 原子写入（临时文件命名：`config.json.tmp.<pid>.<timestamp>`）
@@ -360,9 +385,9 @@ class ConfigWatcher:
    - **严重错误触达：** POST `/skill/alert` 到 SightFlow
 
 3. **配置快照机制**
-   - 消息进入 `_process_message()` 时，从 `ConfigWatcher` 获取当前配置的深拷贝
+   - 消息进入 `_process_message()` 时，从 `ConfigWatcher` 获取当前配置的**深拷贝**
    - 整个消息处理生命周期（AI 请求、排队、发送）都用这份快照
-   - 实现：`config_snapshot = config_watcher.get_config().copy()`
+   - 实现：`import copy; config_snapshot = copy.deepcopy(config_watcher.get_config())`
 
 4. **配置使用**
    - `identity` — 替换 `SELF_WXID`、`SELF_NAMES`
@@ -393,6 +418,13 @@ class ConfigWatcher:
    - 参数化测试各种非法输入（类型错误、字段缺失、格式错误）
    - 有效配置通过校验
    - Schema version 兼容性检查
+   - **identity.names 校验**：至少有一个元素；如果 wxid 存在，自动加到 names 里作为兜底
+
+**ConfigValidator 规则：**
+- `identity.names` 不能为空数组（至少需要一个群昵称）
+- 如果 `identity.wxid` 存在但不在 `names` 里，自动添加（避免用户漏填导致自己消息识别失败）
+- `ai.api_key_format` 必须是 `"dpapi"` 或 `"plaintext"`
+- `version` 必须在支持的范围内
 
 3. **API Key 解密**
    - Mock DPAPI 解密过程
@@ -403,13 +435,19 @@ class ConfigWatcher:
 
 1. **IPC handlers**
    - Mock `child_process.spawn` 测试 wx-cli 调用
-   - 测试 `wx contacts --json` 解析和过滤
+   - 测试 `wx contacts --json` 解析和过滤（**验证：** contacts 输出是否真有 `chat_type` 字段，若无则改用 `sessions --json -n 1000`）
    - 测试 `wx whoami` 调用和 fallback
 
 2. **配置读写**
    - 写入加密配置 → 读取解密 → 验证一致性
    - 原子写入 + retry 逻辑（模拟文件锁定）
    - Schema version 迁移
+
+3. **配置快照机制**
+   - Mock `ConfigWatcher.get_config()` 返回固定 config A
+   - 启动一个消息处理（sleep 在 AI 请求中间）
+   - 处理中途把 `get_config()` 切到返回 config B
+   - 断言当前消息的处理用的是 config A 的参数
 
 ### 手动测试（附注：自动化覆盖不了的原因）
 
@@ -424,7 +462,3 @@ class ConfigWatcher:
 
 4. **杀毒软件锁定文件**
    - 自动化难点：无法可靠模拟杀毒软件行为
-
-5. **配置快照机制**
-   - 验证：修改配置时正在发送的消息是否用旧配置完成
-   - 自动化难点：需要精确控制时序
