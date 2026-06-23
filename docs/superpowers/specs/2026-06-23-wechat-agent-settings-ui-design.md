@@ -334,7 +334,6 @@ class ConfigWatcher:
 - 实现：`import copy; config_snapshot = copy.deepcopy(config_watcher.get_config())`
 - 配置变化时，已在处理的消息不受影响，新消息用新配置
 - **单元测试：** 修改 snapshot 不影响源配置
-- 配置变化时，已在处理的消息不受影响，新消息用新配置
 
 ## 实现范围
 
@@ -359,16 +358,17 @@ class ConfigWatcher:
 4. **IPC 事件（main → renderer）**
    - `wechat-agent:alert-pushed` — main 进程推送 alert 到 renderer（事件订阅，非请求-响应）
 
-4. **配置写入逻辑**
+5. **配置写入逻辑**
    - 原子写入（临时文件命名：`config.json.tmp.<pid>.<timestamp>`）
    - 写入流程：写临时文件 → `fs.rename()` → 失败 retry 3 次（100ms / 200ms / 400ms）
    - 3 次都失败：保留临时文件 + 弹出错误通知
    - 路径处理：`path.join(process.env.APPDATA, 'WeChatAgent')`
    - 加密：`safeStorage.encryptString(apiKey)` → base64 编码（main 进程执行）
 
-5. **Alert 接收**
+6. **Alert 接收**
    - SightFlow Skill Server 新增 `POST /skill/alert` 端点
    - 收到 alert 后：顶部红色 banner + 系统通知（Notification API）
+   - **去重逻辑：** 按 `code` 去重，相同 code 的 alert 在 5 分钟内只展示一次（或直到用户手动关闭）
 
 ### glue-layer 端（Python）
 
@@ -418,13 +418,11 @@ class ConfigWatcher:
    - 参数化测试各种非法输入（类型错误、字段缺失、格式错误）
    - 有效配置通过校验
    - Schema version 兼容性检查
-   - **identity.names 校验**：至少有一个元素；如果 wxid 存在，自动加到 names 里作为兜底
-
-**ConfigValidator 规则：**
-- `identity.names` 不能为空数组（至少需要一个群昵称）
-- 如果 `identity.wxid` 存在但不在 `names` 里，自动添加（避免用户漏填导致自己消息识别失败）
-- `ai.api_key_format` 必须是 `"dpapi"` 或 `"plaintext"`
-- `version` 必须在支持的范围内
+   - **校验规则：**
+     - `identity.wxid` 不能为空（用于自己消息识别）
+     - `identity.names` 不能为空数组（至少需要一个群昵称，用于 @-mention 检测）
+     - `ai.api_key_format` 必须是 `"dpapi"` 或 `"plaintext"`
+     - `version` 必须在支持的范围内
 
 3. **API Key 解密**
    - Mock DPAPI 解密过程
