@@ -6,6 +6,37 @@
 
 **平台：** 仅支持 Windows
 
+## 前置依赖
+
+### 1. wx-cli 需要提供 `wx whoami` 子命令
+
+**需求：** 返回当前登录的 wxid，用于 UI "自动检测"按钮
+
+**实现方式（wx-cli 端）：**
+- 从 contact 表里查找 `type` 标记为自身的记录（微信本地 DB 里自己的记录有特殊标识）
+- 或从 `~/.wx-cli/config.json` 读取缓存的 uin/wxid
+
+**未实现前的 fallback：**
+- UI "自动检测"按钮置灰，提示"请先升级 wx-cli"
+- 用户手动输入 wxid（文本框仍可编辑）
+
+**备注：** 此任务需要在 wx-cli 仓库独立完成，不在本设计范围内
+
+### 2. Python 端 DPAPI 解密依赖
+
+**选定方案：** 使用 `pywin32` 库的 `win32crypt.CryptUnprotectData`
+
+**理由：**
+- 封装好，无需手写 ctypes 结构体
+- 性能可接受（配置加载频率低）
+- 社区成熟，文档齐全
+
+**实现细节：**
+- `requirements.txt` 添加：`pywin32; sys_platform == 'win32'`
+- Electron `safeStorage.encryptString()` 在 Windows 上调用 `CryptProtectData` 时 entropy 为 NULL
+- Python 端调用 `CryptUnprotectData` 时也传 NULL entropy，同用户同机器可解密
+- **验证项：** 实测确认 Electron safeStorage 的 entropy 参数（预期为 NULL）
+
 ## 设计决策
 
 ### 1. UI 位置：扩展 SightFlow 设置页
@@ -156,8 +187,8 @@ SightFlow (Electron)                glue-layer (Python)
   },
   "ai": {
     "api_url": "https://api.openai.com/v1",
-    "api_key_encrypted": "base64-encoded-encrypted-data",
-    "api_key_encrypted_flag": true,
+    "api_key": "base64-encoded-encrypted-data",
+    "api_key_format": "dpapi",
     "model": "gpt-4o-mini"
   },
   "advanced": {
@@ -167,14 +198,25 @@ SightFlow (Electron)                glue-layer (Python)
 ```
 
 **设计要点：**
-- `version` 字段用于未来配置迁移（写入方负责升级 schema）
+- `version` 字段用于配置迁移（写入方负责升级，读取方遇到未知 version 保留旧配置 + 提示）
 - `identity.names` 是数组，UI 用 tag input，JSON 存结构化数据
 - `groups.monitor` 存 room_id + name，glue-layer 直接使用（无需再查映射）
-- `ai.api_key_encrypted`：DPAPI 加密后的 base64 字符串
-- `ai.api_key_encrypted_flag`：标记是否已加密（未来兼容明文迁移）
+- `ai.api_key`：加密后的 base64 字符串（或明文，取决于 `api_key_format`）
+- `ai.api_key_format`：枚举值 `"dpapi"` | `"plaintext"`（未来可扩展 `"keychain"` | `"libsecret"`）
 - `ai.model`：用户填写的模型名（文本框，非下拉）
 - `advanced.wx_cli_path`：wx-cli 路径（默认 `wx`，自动检测 PATH）
-- 文件写入用原子操作（写临时文件 → rename），Windows 上 rename 失败时 retry 3 次（间隔 100ms），防杀毒软件短暂锁文件
+
+**Schema 版本兼容规则：**
+- 写入方（SightFlow）：负责把旧版本升级到最新版本再写入
+- 读取方（glue-layer）：遇到未知 version 时保留旧配置 + 弹提示，不尝试解析
+- 双向都要有 version 范围概念：`if version not in supported_versions: handle_error()`
+
+**原子写入细节（Windows）：**
+- 临时文件命名：`config.json.tmp.<pid>.<timestamp>`（避免多实例冲突）
+- 写入流程：写临时文件 → `os.replace()` rename → 失败则 retry
+- Retry 策略：最多 3 次，间隔 100ms / 200ms / 400ms（指数退避）
+- 3 次都失败：保留临时文件 + 弹出错误通知 + 日志记录
+- 杀毒软件短暂锁文件时，retry 通常能成功
 
 ## 热重载机制
 
@@ -250,14 +292,26 @@ class ConfigWatcher:
 
 | 场景 | 预期行为 |
 |------|----------|
-| SightFlow 没启动 | glue-layer 继续用上次配置运行，日志里显示"SightFlow 未连接" |
-| wx-cli daemon 没跑 | UI 群组列表为空，glue-layer 日志显示"wx-cli 不可用" |
+| SightFlow 没启动 | glue-layer 继续用上次配置运行，日志显示"SightFlow 未连接" |
+| wx-cli daemon 没跑 | UI 群组列表为空，显示"请先启动 wx-cli daemon"；glue-layer 日志显示"wx-cli 不可用" |
 | 配置文件不存在 | glue-layer 用默认配置运行（空配置），UI 显示"未配置" |
 | 配置文件格式错误 | glue-layer 保留旧配置，日志显示错误详情 |
-| API Key 解密失败 | glue-layer 日志显示"API Key 需要重新配置"，AI 功能不可用 |
-| 用户改配置时正在发消息 | 当前消息用旧配置完成，下一条消息用新配置 |
+| API Key 解密失败 | glue-layer 向 SightFlow POST `/skill/alert`，UI 顶部显示红色 banner + 系统通知 |
+| 用户改配置时正在发消息 | **配置快照机制**：消息进入处理流程时 snapshot 配置，整个生命周期用同一份快照 |
 | wx-cli 路径错误 | UI 群组列表加载失败，显示"wx-cli 未找到" |
-| 文件被杀毒软件锁定 | 写入失败，retry 3 次，仍失败则显示错误提示 |
+| 文件被杀毒软件锁定 | 写入 retry 3 次（指数退避），仍失败则弹出错误通知 |
+| wx whoami 不可用 | UI "自动检测"按钮置灰，提示"请先升级 wx-cli" |
+| Schema version 不兼容 | 保留旧配置 + 提示"配置版本不兼容，请升级软件" |
+
+**严重错误的用户触达：**
+- API Key 解密失败、配置文件损坏等严重错误，glue-layer 主动 POST `/skill/alert` 到 SightFlow
+- SightFlow 收到 alert 后：顶部红色 banner + 系统通知（Notification API）
+- 确保用户即使没开日志面板也能看到
+
+**配置快照机制：**
+- 消息进入 `_process_message()` 时，从 `ConfigWatcher` 获取当前配置的深拷贝
+- 整个消息处理生命周期（AI 请求、排队、发送）都用这份快照
+- 配置变化时，已在处理的消息不受影响，新消息用新配置
 
 ## 实现范围
 
@@ -276,27 +330,41 @@ class ConfigWatcher:
 3. **IPC handlers**
    - `wechat-agent:getGroups` — 调用 `wx contacts --json` 过滤群组
    - `wechat-agent:detectWxid` — 调用 `wx whoami` 或读取 wx-cli 缓存
-   - `wechat-agent:saveConfig` — 加密 API Key，写入 `%APPDATA%\WeChatAgent\config.json`
+   - `wechat-agent:saveConfig` — **renderer 传明文 API Key，main 进程加密后写入**
    - `wechat-agent:loadConfig` — 读取并解密配置（用于初始化 UI）
+   - `wechat-agent:receiveAlert` — 接收 glue-layer 的 `/skill/alert` 推送
 
 4. **配置写入逻辑**
-   - 原子写入（写临时文件 → rename，失败 retry 3 次）
+   - 原子写入（临时文件命名：`config.json.tmp.<pid>.<timestamp>`）
+   - 写入流程：写临时文件 → `fs.rename()` → 失败 retry 3 次（100ms / 200ms / 400ms）
+   - 3 次都失败：保留临时文件 + 弹出错误通知
    - 路径处理：`path.join(process.env.APPDATA, 'WeChatAgent')`
-   - 加密：`safeStorage.encryptString(apiKey)` → base64 编码
+   - 加密：`safeStorage.encryptString(apiKey)` → base64 编码（main 进程执行）
+
+5. **Alert 接收**
+   - SightFlow Skill Server 新增 `POST /skill/alert` 端点
+   - 收到 alert 后：顶部红色 banner + 系统通知（Notification API）
 
 ### glue-layer 端（Python）
 
 1. **配置加载模块**
    - `config_loader.py` — 从 JSON 文件加载配置
    - `ConfigValidator` — 用 pydantic 做 schema 校验
-   - API Key 解密：调用系统命令或直接用 ctypes + CryptUnprotectData（DPAPI）
+   - API Key 解密：`win32crypt.CryptUnprotectData`（pywin32 库）
+   - **依赖：** `requirements.txt` 添加 `pywin32; sys_platform == 'win32'`
 
 2. **热重载机制**
    - `ConfigWatcher` 类，集成到 `WeChatAgent._poll_loop()`
    - 配置变化时重建 AI 客户端、更新群列表
    - 错误处理：加载失败保留旧配置，不 crash
+   - **严重错误触达：** POST `/skill/alert` 到 SightFlow
 
-3. **配置使用**
+3. **配置快照机制**
+   - 消息进入 `_process_message()` 时，从 `ConfigWatcher` 获取当前配置的深拷贝
+   - 整个消息处理生命周期（AI 请求、排队、发送）都用这份快照
+   - 实现：`config_snapshot = config_watcher.get_config().copy()`
+
+4. **配置使用**
    - `identity` — 替换 `SELF_WXID`、`SELF_NAMES`
    - `groups.monitor` — 替换硬编码的群过滤逻辑
    - `ai.*` — 替换 `AI_API_URL`、`AI_API_KEY`、`AI_MODEL`
@@ -309,6 +377,7 @@ class ConfigWatcher:
 - 消息历史记录
 - 多账号支持
 - 跨平台支持（仅 Windows）
+- wx-cli `whoami` 命令实现（前置依赖，独立任务）
 
 ## 测试策略
 
@@ -323,22 +392,39 @@ class ConfigWatcher:
 2. **ConfigValidator**
    - 参数化测试各种非法输入（类型错误、字段缺失、格式错误）
    - 有效配置通过校验
+   - Schema version 兼容性检查
 
 3. **API Key 解密**
    - Mock DPAPI 解密过程
    - 解密失败处理
+   - `api_key_format` 枚举处理（dpapi / plaintext）
 
 ### 集成测试（TypeScript）
 
 1. **IPC handlers**
    - Mock `child_process.spawn` 测试 wx-cli 调用
    - 测试 `wx contacts --json` 解析和过滤
+   - 测试 `wx whoami` 调用和 fallback
 
 2. **配置读写**
    - 写入加密配置 → 读取解密 → 验证一致性
-   - 原子写入 + retry 逻辑
+   - 原子写入 + retry 逻辑（模拟文件锁定）
+   - Schema version 迁移
 
-### 手动测试
+### 手动测试（附注：自动化覆盖不了的原因）
 
-- 修改配置后验证 glue-layer 热重载
-- 边界情况：配置文件不存在、格式错误、权限问题、API Key 解密失败
+1. **修改配置后验证 glue-layer 热重载**
+   - 自动化难点：需要真实运行 wx-cli daemon + 微信客户端
+
+2. **配置文件格式错误恢复**
+   - 自动化难点：需要手动破坏 JSON 文件观察行为
+
+3. **API Key 解密失败（跨机器拷贝）**
+   - 自动化难点：需要在另一台机器上测试
+
+4. **杀毒软件锁定文件**
+   - 自动化难点：无法可靠模拟杀毒软件行为
+
+5. **配置快照机制**
+   - 验证：修改配置时正在发送的消息是否用旧配置完成
+   - 自动化难点：需要精确控制时序
