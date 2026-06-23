@@ -13,11 +13,9 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
-from config import (
-    WX_CLI_PATH, WX_POLL_INTERVAL,
-    SIGHTFLOW_API_URL,
-    SELF_WXID
-)
+from config import SIGHTFLOW_API_URL, WX_POLL_INTERVAL
+from config_watcher import ConfigWatcher
+from config_model import AgentConfig, get_config_path
 from wxid_mapper import WxidMapper
 from ai_client import AIClient
 from message_queue import MessageQueue
@@ -158,20 +156,57 @@ class WeChatAgent:
     """微信自动回复 Agent 主类"""
 
     def __init__(self):
-        self.mapper = WxidMapper(WX_CLI_PATH)
-        self.ai_client = AIClient()
+        # 配置监听器
+        self._config_watcher = ConfigWatcher(get_config_path())
+        self._config_watcher.check_for_updates()  # 首次加载
+
+        # 从配置获取 wx_cli_path
+        config = self._config_watcher.get_config()
+        wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
+
+        self.mapper = WxidMapper(wx_cli_path)
+        self.ai_client = self._create_ai_client()
         self.message_queue: Optional[MessageQueue] = None
-        # 已处理消息标识缓存（防重复）- 使用 时间戳+发送者+内容hash
         self._processed_keys: Set[str] = set()
-        # 发送时间记录（防刷屏）
         self._send_times: deque = deque(maxlen=MAX_MESSAGES_PER_MINUTE)
-        # 已回复会话时间戳（避免重复回复同一会话的旧消息）
         self._last_reply_ts: Dict[str, int] = {}
-        # 启动时间戳：忽略此时间之前的历史消息
         self._start_timestamp = int(time.time())
-        # 已发送消息跟踪（防止回环）：记录每个联系人的最后发送时间
-        # 发送后 ECHO_QUIET_SECONDS 秒内跳过该联系人的消息（防 echo）
         self._last_send_time: Dict[str, float] = {}
+
+    def _create_ai_client(self) -> Optional[AIClient]:
+        """从当前配置创建 AI 客户端，配置未加载返回 None"""
+        config = self._config_watcher.get_config()
+        if config is None:
+            print("[WeChatAgent] 配置未加载，AI 客户端不可用", flush=True)
+            return None
+        try:
+            api_key = config.resolved_api_key
+            return AIClient(
+                api_key=api_key,
+                api_url=config.ai.api_url,
+                model=config.ai.model
+            )
+        except Exception as e:
+            print(f"[WeChatAgent] AI 客户端创建失败: {e}，发送 alert", flush=True)
+            self._send_alert('api_key_decrypt_failed', f'API Key 解密失败: {e}')
+            return None
+
+    def _send_alert(self, code: str, message: str, severity: str = 'critical'):
+        """向 SightFlow 发送错误告警"""
+        try:
+            alert = {
+                "severity": severity,
+                "code": code,
+                "message": message,
+                "timestamp": int(time.time())
+            }
+            requests.post(
+                f"{SIGHTFLOW_API_URL}/skill/alert",
+                json=alert,
+                timeout=5
+            )
+        except Exception as e:
+            print(f"[WeChatAgent] 发送 alert 失败: {e}", flush=True)
 
     def _make_msg_key(self, msg: dict) -> str:
         """生成消息唯一标识：时间戳+发送者+内容hash"""
@@ -208,6 +243,13 @@ class WeChatAgent:
         MAPPER_REFRESH_INTERVAL = 60  # 每 60 次轮询（约 5 分钟）刷新一次映射表
         while True:
             try:
+                # === 检查配置更新 ===
+                if self._config_watcher.check_for_updates():
+                    config = self._config_watcher.get_config()
+                    if config:
+                        self.ai_client = self._create_ai_client()
+                        print(f"[WeChatAgent] AI 客户端已重建", flush=True)
+
                 # 检查自动驾驶状态
                 if not check_autopilot_enabled():
                     heartbeat_counter += 1
@@ -252,9 +294,11 @@ class WeChatAgent:
 
     def _get_new_messages(self) -> List[dict]:
         """使用 wx new-messages 获取自上次检查以来的新消息"""
+        config = self._config_watcher.get_config()
+        wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
         try:
             result = subprocess.run(
-                [WX_CLI_PATH, 'new-messages', '--json', '-n', '50'],
+                [wx_cli_path, 'new-messages', '--json', '-n', '50'],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
@@ -275,7 +319,11 @@ class WeChatAgent:
             return []
 
     def _process_new_message(self, msg: dict):
-        """处理单条新消息（来自 wx new-messages）"""
+        # 获取配置快照（深拷贝，整个消息处理生命周期用同一份）
+        config = self._config_watcher.get_config_snapshot()
+        if config is None:
+            return  # 配置未加载，跳过
+
         username = msg.get('username', '')
         sender = msg.get('sender', '')
         content = msg.get('content', '')
@@ -290,27 +338,25 @@ class WeChatAgent:
             return
         self._processed_keys.add(msg_key)
 
-        # 跳过启动前的历史消息（但已记录 processed_keys 防止重复）
+        # 跳过启动前的历史消息
         if timestamp > 0 and timestamp < self._start_timestamp:
             return
 
-        # 跳过自己发送的消息
-        if sender == '192' or sender == SELF_WXID:
-            return
-
-        # 跳过自己发送的回复（防止回环）
-        # 发送后 ECHO_QUIET_SECONDS 秒内，跳过该联系人的所有消息
-        # 微信会将我们发送的消息回显为对方发来的，用时间窗口过滤
-        last_send = self._last_send_time.get(username, 0)
-        if last_send and time.time() - last_send < ECHO_QUIET_SECONDS:
-            print(f"[WeChatAgent] 静默期跳过 (距发送 {time.time() - last_send:.1f}s): {username}", flush=True)
+        # 使用配置快照中的 wxid 判断自己发送的消息
+        if sender == config.identity.wxid:
             return
 
         # 跳过系统消息
         if msg_type == '系统':
             return
 
-        # 构造 session 字典（复用 _process_message 逻辑）
+        # 跳过自己发送的回复（防止回环）
+        last_send = self._last_send_time.get(username, 0)
+        if last_send and time.time() - last_send < ECHO_QUIET_SECONDS:
+            print(f"[WeChatAgent] 静默期跳过 (距发送 {time.time() - last_send:.1f}s): {username}", flush=True)
+            return
+
+        # 构造 session 字典
         session = {
             'username': username,
             'chat_type': chat_type,
@@ -318,9 +364,10 @@ class WeChatAgent:
             'timestamp': timestamp
         }
 
-        self._process_message(msg, session)
+        # 传递 config 快照给 _process_message
+        self._process_message(msg, session, config)
 
-    def _process_message(self, msg: dict, session: dict):
+    def _process_message(self, msg: dict, session: dict, config: AgentConfig):
         """处理单条消息"""
         # 防刷屏检查
         now = time.time()
@@ -329,6 +376,11 @@ class WeChatAgent:
 
         if len(self._send_times) >= MAX_MESSAGES_PER_MINUTE:
             print(f"[WeChatAgent] 已达发送上限 ({MAX_MESSAGES_PER_MINUTE}/{MESSAGE_WINDOW_SECONDS}s)，跳过", flush=True)
+            return
+
+        # AI 客户端检查
+        if self.ai_client is None:
+            print("[WeChatAgent] AI 客户端未就绪，跳过", flush=True)
             return
 
         # 获取联系人名（从 session 获取，因为 history 消息没有 sender_wxid）
@@ -357,7 +409,7 @@ class WeChatAgent:
                 target = chat_name
 
             # 群聊：只有被 @ 才回复，否则只监控
-            should_reply = self._is_mentioned(content)
+            should_reply = self._is_mentioned(content, config)
             sender = msg.get('sender', '') or session.get('chat', '')
 
             if should_reply:
@@ -398,20 +450,12 @@ class WeChatAgent:
             print(f"[WeChatAgent] AI 决定不回复: {target}", flush=True)
             send_log_to_sightflow('skip', 'AI 决定不回复', target)
 
-    def _is_mentioned(self, content: str) -> bool:
-        """检测群消息中是否 @ 了自己"""
-        from config import SELF_NAMES
-
-        if not SELF_NAMES:
-            # 未配置自己的名字，默认回复所有群消息
+    def _is_mentioned(self, content: str, config: AgentConfig) -> bool:
+        """检测群消息中是否 @ 了自己（使用配置快照）"""
+        if not config.identity.names:
             return True
 
-        # 检测消息内容中是否包含 @自己的名字
-        # 支持多个名字配置（逗号分隔）
-        names = [name.strip() for name in SELF_NAMES.split(',') if name.strip()]
-
-        for name in names:
-            # 微信群聊 @ 格式：@昵称 或 @群名片
+        for name in config.identity.names:
             if f"@{name}" in content:
                 return True
 
