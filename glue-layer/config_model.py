@@ -28,9 +28,10 @@ class GroupsConfig:
 
 @dataclass
 class AIConfig:
-    api_url: str
-    api_key: str  # 可能是明文或加密后的 base64
-    api_key_format: str  # "dpapi" | "plaintext"
+    """AI 配置（已废弃，AI 调用统一走 SightFlow Provider）"""
+    api_url: str = ""
+    api_key: str = ""
+    api_key_format: str = "plaintext"  # "dpapi" | "plaintext"
     model: str = "gpt-4o-mini"
 
 
@@ -49,13 +50,8 @@ class AgentConfig:
 
     @property
     def resolved_api_key(self) -> str:
-        """返回解密后的 API Key（plaintext 直接返回，dpapi 需要解密）"""
-        if self.ai.api_key_format == "plaintext":
-            return self.ai.api_key
-        elif self.ai.api_key_format == "dpapi":
-            return decrypt_dpapi(self.ai.api_key)
-        else:
-            raise ValueError(f"Unknown api_key_format: {self.ai.api_key_format}")
+        """已废弃：AI 调用统一走 SightFlow Provider，此属性不再使用"""
+        return ""
 
 
 def decrypt_dpapi(encrypted_base64: str) -> str:
@@ -125,16 +121,10 @@ class ConfigValidator:
             monitor.append(GroupEntry(room_id=g['room_id'], name=g['name']))
         groups = GroupsConfig(monitor=monitor)
 
-        # AI 校验
-        ai_data = data.get('ai')
-        if not ai_data:
-            raise ValueError("Missing required field: ai")
+        # AI 校验（已废弃，AI 调用统一走 SightFlow Provider，这里只做兼容性处理）
+        ai_data = data.get('ai', {})
         api_url = ai_data.get('api_url', '')
-        if not api_url:
-            raise ValueError("ai.api_url cannot be empty")
         api_key = ai_data.get('api_key', '')
-        if not api_key:
-            raise ValueError("ai.api_key cannot be empty")
         api_key_format = ai_data.get('api_key_format', 'plaintext')
         if api_key_format not in ('dpapi', 'plaintext'):
             raise ValueError(f"ai.api_key_format must be 'dpapi' or 'plaintext', got '{api_key_format}'")

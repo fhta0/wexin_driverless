@@ -194,7 +194,7 @@ class WeChatAgent:
         wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
 
         self.mapper = WxidMapper(wx_cli_path)
-        self._validate_ai_config()  # 启动时校验 AI 配置，失败则发送 alert
+        # 不再需要校验 AI 配置，因为 AI 调用统一走 SightFlow Provider
         self.message_queue: Optional[MessageQueue] = None
         self._processed_keys: Set[str] = set()
         self._send_times: deque = deque(maxlen=MAX_MESSAGES_PER_MINUTE)
@@ -203,17 +203,8 @@ class WeChatAgent:
         self._last_send_time: Dict[str, float] = {}
 
     def _validate_ai_config(self) -> None:
-        """校验 AI 配置是否可用，不可用则发送 alert（启动时和配置变化时调用）"""
-        config = self._config_watcher.get_config()
-        if config is None:
-            print("[WeChatAgent] 配置未加载", flush=True)
-            return
-        try:
-            # 尝试访问 resolved_api_key，如果解密失败会抛异常
-            _ = config.resolved_api_key
-        except Exception as e:
-            print(f"[WeChatAgent] AI 配置校验失败: {e}，发送 alert", flush=True)
-            self._send_alert('api_key_decrypt_failed', f'API Key 解密失败: {e}')
+        """已废弃：AI 配置统一走 SightFlow Provider，不再需要校验"""
+        pass
 
     def _send_alert(self, code: str, message: str, severity: str = 'critical'):
         """向 SightFlow 发送错误告警"""
@@ -269,7 +260,8 @@ class WeChatAgent:
             try:
                 # === 检查配置更新 ===
                 if self._config_watcher.check_for_updates():
-                    self._validate_ai_config()
+                    # AI 配置统一走 SightFlow Provider，不再需要校验
+                    pass
 
                 # 检查自动驾驶状态
                 if not check_autopilot_enabled():
@@ -399,13 +391,9 @@ class WeChatAgent:
             print(f"[WeChatAgent] 已达发送上限 ({MAX_MESSAGES_PER_MINUTE}/{MESSAGE_WINDOW_SECONDS}s)，跳过", flush=True)
             return
 
-        # 从配置快照构建 AI 客户端（保证整个消息处理生命周期用同一份配置）
+        # 从配置快照构建 AI 客户端（使用 SightFlow 统一 Provider 系统）
         try:
-            ai_client = AIClient(
-                api_key=config.resolved_api_key,
-                api_url=config.ai.api_url,
-                model=config.ai.model
-            )
+            ai_client = AIClient()  # 默认使用 http://127.0.0.1:12680
         except Exception as e:
             print(f"[WeChatAgent] AI 客户端构建失败: {e}", flush=True)
             return

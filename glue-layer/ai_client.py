@@ -1,29 +1,20 @@
 # glue-layer/ai_client.py
+import requests
 from typing import Optional
-from openai import OpenAI
 
 class AIClient:
-    """AI API 调用客户端"""
+    """通过 SightFlow HTTP API 调用 AI 生成回复（统一 Provider 系统）"""
 
-    def __init__(self, api_key: str, api_url: str = "https://api.openai.com/v1", model: str = "gpt-4o-mini"):
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=api_url
-        )
-        self.model = model
-
-        # 系统提示词
-        self.system_prompt = """你是一个微信自动回复助手。
-根据收到的消息，生成简洁、自然、友好的回复。
-回复应该：
-1. 简短（通常 1-2 句话）
-2. 自然，像真人回复
-3. 避免过于正式或机械
-4. 不要回复自己的消息"""
+    def __init__(self, sightflow_url: str = "http://127.0.0.1:12680"):
+        """
+        Args:
+            sightflow_url: SightFlow Skill Server 的 URL
+        """
+        self.sightflow_url = sightflow_url
 
     def generate_reply(self, context: str, target: str) -> Optional[str]:
         """
-        根据上下文生成回复
+        通过 SightFlow API 生成回复
 
         Args:
             context: 消息上下文（如 "来自张三的私聊消息：你好"）
@@ -33,25 +24,33 @@ class AIClient:
             生成的回复文本，或 None（表示跳过回复）
         """
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": f"收到消息：{context}\n请生成回复（回复给 {target}）："}
-                ],
-                max_tokens=100,
-                temperature=0.7
+            response = requests.post(
+                f"{self.sightflow_url}/skill/generate-reply",
+                json={
+                    "context": context,
+                    "target": target
+                },
+                timeout=30
             )
 
-            reply = response.choices[0].message.content.strip()
-
-            # 如果回复表示跳过（如"无需回复"、"不回复"等），返回 None
-            skip_keywords = ['无需回复', '不回复', '跳过', '暂不回复', '不用回复']
-            if any(kw in reply for kw in skip_keywords):
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('ok'):
+                    return data.get('reply')
+                else:
+                    error = data.get('error', 'unknown')
+                    if error == 'skip':
+                        print(f"[AIClient] AI 决定不回复")
+                        return None
+                    print(f"[AIClient] 生成回复失败: {error}")
+                    return None
+            else:
+                print(f"[AIClient] HTTP 错误: {response.status_code}")
                 return None
 
-            return reply
-
+        except requests.exceptions.Timeout:
+            print(f"[AIClient] 生成回复超时")
+            return None
         except Exception as e:
             print(f"[AIClient] 生成回复失败: {e}")
             return None

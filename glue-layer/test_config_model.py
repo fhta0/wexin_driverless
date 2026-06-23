@@ -28,15 +28,27 @@ class TestConfigValidator:
         with pytest.raises(ValueError, match="wxid"):
             ConfigValidator.validate(data)
 
-    def test_empty_names_fails(self):
+    def test_empty_names_allowed(self):
+        """names 可以为空（AI 调用统一走 SightFlow Provider，不再需要 names 来检测 @）"""
         data = {
             "version": 1,
             "identity": {"wxid": "wxid_test", "names": []},
             "groups": {"monitor": []},
             "ai": {"api_url": "https://api.test.com", "api_key": "sk-test", "api_key_format": "plaintext", "model": "gpt-4o-mini"}
         }
-        with pytest.raises(ValueError, match="names"):
-            ConfigValidator.validate(data)
+        config = ConfigValidator.validate(data)
+        assert config.identity.names == []
+
+    def test_missing_ai_allowed(self):
+        """AI 配置可以为空（AI 调用统一走 SightFlow Provider）"""
+        data = {
+            "version": 1,
+            "identity": {"wxid": "wxid_test", "names": ["测试"]},
+            "groups": {"monitor": []},
+        }
+        config = ConfigValidator.validate(data)
+        assert config.ai.api_url == ""
+        assert config.ai.api_key == ""
 
     def test_invalid_api_key_format_fails(self):
         data = {
