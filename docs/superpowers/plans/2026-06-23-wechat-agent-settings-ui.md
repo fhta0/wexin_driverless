@@ -13,6 +13,10 @@
 - `wx whoami` 命令不存在，作为前置依赖在 wx-cli 仓库独立实现；UI 先做 fallback（按钮置灰）
 - `wx sessions` 输出包含 `chat_type` 字段（已确认）
 
+**已确认的代码基础设施：**
+- `broadcastToAllWindows()` 函数存在于 `skill-server.ts`（第 278 行），可直接在 alert handler 中使用
+- `window.electron.invoke/on/send` API 存在于 `src/preload/index.ts`，renderer 通过 `window.electron` 访问
+
 ---
 
 ### Task 1: 验证前置条件
@@ -61,12 +65,12 @@ D:/miniconda/envs/py3.12/python.exe -c "import win32crypt; print('OK')"
 
 **Files:**
 - Create: `glue-layer/config_model.py`
-- Create: `glue-layer/tests/test_config_model.py`
+- Create: `glue-layer/test_config_model.py`（放在 glue-layer 根目录，避免 import 路径问题）
 
 - [ ] **Step 1: 创建测试文件**
 
 ```python
-# glue-layer/tests/test_config_model.py
+# glue-layer/test_config_model.py
 import json
 import pytest
 from config_model import AgentConfig, ConfigValidator
@@ -348,12 +352,12 @@ git commit -m "feat: 添加配置模型和校验器 (config_model.py)"
 
 **Files:**
 - Create: `glue-layer/config_watcher.py`
-- Create: `glue-layer/tests/test_config_watcher.py`
+- Create: `glue-layer/test_config_watcher.py`（放在 glue-layer 根目录）
 
 - [ ] **Step 1: 创建测试文件**
 
 ```python
-# glue-layer/tests/test_config_watcher.py
+# glue-layer/test_config_watcher.py
 import json
 import os
 import time
@@ -612,12 +616,12 @@ class WeChatAgent:
         self._start_timestamp = int(time.time())
         self._last_send_time: Dict[str, float] = {}
 
-    def _create_ai_client(self) -> AIClient:
-        """从当前配置创建 AI 客户端"""
+    def _create_ai_client(self) -> Optional[AIClient]:
+        """从当前配置创建 AI 客户端，配置未加载返回 None"""
         config = self._config_watcher.get_config()
         if config is None:
-            print("[WeChatAgent] 配置未加载，使用默认 AI 客户端", flush=True)
-            return AIClient()
+            print("[WeChatAgent] 配置未加载，AI 客户端不可用", flush=True)
+            return None
         try:
             api_key = config.resolved_api_key
             return AIClient(
@@ -628,7 +632,7 @@ class WeChatAgent:
         except Exception as e:
             print(f"[WeChatAgent] AI 客户端创建失败: {e}，发送 alert", flush=True)
             self._send_alert('api_key_decrypt_failed', f'API Key 解密失败: {e}')
-            return AIClient()  # fallback
+            return None
 
     def _send_alert(self, code: str, message: str, severity: str = 'critical'):
         """向 SightFlow 发送错误告警"""
@@ -672,11 +676,11 @@ class WeChatAgent:
                     ...
 ```
 
-- [ ] **Step 4: 修改 _process_new_message 使用配置快照**
+- [ ] **Step 4: 修改 _process_new_message 使用配置快照，传递给 _process_message**
 
 ```python
     def _process_new_message(self, msg: dict):
-        # 获取配置快照
+        # 获取配置快照（深拷贝，整个消息处理生命周期用同一份）
         config = self._config_watcher.get_config_snapshot()
         if config is None:
             return  # 配置未加载，跳过
@@ -684,21 +688,72 @@ class WeChatAgent:
         username = msg.get('username', '')
         sender = msg.get('sender', '')
         content = msg.get('content', '')
-        # ... 其余代码不变 ...
+        msg_type = msg.get('type', '')
+        chat_type = msg.get('chat_type', 'private')
+        chat_name = msg.get('chat', '')
+        timestamp = msg.get('timestamp', 0)
 
-        # 替换: if sender == '192' or sender == SELF_WXID:
-        # 改为:
+        # 生成消息唯一标识，防重复
+        msg_key = self._make_msg_key(msg)
+        if msg_key in self._processed_keys:
+            return
+        self._processed_keys.add(msg_key)
+
+        # 跳过启动前的历史消息
+        if timestamp > 0 and timestamp < self._start_timestamp:
+            return
+
+        # 使用配置快照中的 wxid 判断自己发送的消息
         if sender == config.identity.wxid:
             return
 
-        # ... 其余代码不变 ...
+        # 跳过系统消息
+        if msg_type == '系统':
+            return
+
+        # ... echo 静默期检查（不变）...
+
+        # 构造 session 字典
+        session = {
+            'username': username,
+            'chat_type': chat_type,
+            'chat': chat_name,
+            'timestamp': timestamp
+        }
+
+        # 传递 config 快照给 _process_message
+        self._process_message(msg, session, config)
 ```
 
-- [ ] **Step 5: 修改 _is_mentioned 使用配置快照**
+- [ ] **Step 5: 修改 _process_message 签名，接受 config 参数**
+
+```python
+    def _process_message(self, msg: dict, session: dict, config: AgentConfig):
+        """处理单条消息（config 为快照，保证生命周期内一致）"""
+        # AI 客户端检查
+        if self.ai_client is None:
+            print("[WeChatAgent] AI 客户端未就绪，跳过", flush=True)
+            return
+
+        # 防刷屏检查（不变）
+        now = time.time()
+        while self._send_times and self._send_times[0] < now - MESSAGE_WINDOW_SECONDS:
+            self._send_times.popleft()
+        if len(self._send_times) >= MAX_MESSAGES_PER_MINUTE:
+            return
+
+        # ... 其余代码中，使用 config 替换原来的全局配置 ...
+
+        # 群聊 @ 检测：使用 config 快照
+        # 替换: should_reply = self._is_mentioned(content)
+        should_reply = self._is_mentioned(content, config)
+```
+
+- [ ] **Step 6: 修改 _is_mentioned 接受 config 参数**
 
 ```python
     def _is_mentioned(self, content: str, config: AgentConfig) -> bool:
-        """检测群消息中是否 @ 了自己"""
+        """检测群消息中是否 @ 了自己（使用配置快照）"""
         if not config.identity.names:
             return True
 
@@ -708,20 +763,12 @@ class WeChatAgent:
         return False
 ```
 
-更新 `_process_message` 中的调用：
-
-```python
-        # 替换: should_reply = self._is_mentioned(content)
-        # 改为:
-        should_reply = self._is_mentioned(content, config)
-```
-
-- [ ] **Step 6: 修改 _get_new_messages 使用配置中的 wx_cli_path**
+- [ ] **Step 7: 修改 _get_new_messages 使用配置中的 wx_cli_path**
 
 ```python
     def _get_new_messages(self) -> List[dict]:
         config = self._config_watcher.get_config()
-        wx_cli_path = config.advanced.wx_cli_path if config else WX_CLI_PATH
+        wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
         try:
             result = subprocess.run(
                 [wx_cli_path, 'new-messages', '--json', '-n', '50'],
@@ -759,8 +806,13 @@ import { safeStorage } from 'electron'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
+import { setTimeout as sleep } from 'timers/promises'
 
-const CONFIG_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), '.wechat-agent'), 'WeChatAgent')
+// Windows: %APPDATA%\WeChatAgent\
+// Fallback (非 Windows): ~/.wechat-agent/
+const CONFIG_DIR = process.env.APPDATA
+  ? path.join(process.env.APPDATA, 'WeChatAgent')
+  : path.join(os.homedir(), '.wechat-agent')
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json')
 const SUPPORTED_VERSION = 1
 
@@ -818,7 +870,7 @@ export function loadConfig(): WechatAgentConfig | null {
 }
 
 /** 写入配置（加密 API Key，原子写入） */
-export function saveConfig(config: WechatAgentConfig): { ok: boolean; error?: string } {
+export async function saveConfig(config: WechatAgentConfig): Promise<{ ok: boolean; error?: string }> {
   try {
     // 确保目录存在
     fs.mkdirSync(CONFIG_DIR, { recursive: true })
@@ -837,7 +889,7 @@ export function saveConfig(config: WechatAgentConfig): { ok: boolean; error?: st
     const tmpFile = `${CONFIG_FILE}.tmp.${process.pid}.${Date.now()}`
     fs.writeFileSync(tmpFile, JSON.stringify(toWrite, null, 2), 'utf-8')
 
-    // Windows rename 可能因杀毒软件短暂锁定而失败，retry 3 次
+    // Windows rename 可能因杀毒软件短暂锁定而失败，retry 3 次（指数退避）
     let lastError: Error | null = null
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -845,10 +897,7 @@ export function saveConfig(config: WechatAgentConfig): { ok: boolean; error?: st
         return { ok: true }
       } catch (e) {
         lastError = e as Error
-        const delay = 100 * Math.pow(2, attempt)  // 100ms, 200ms, 400ms
-        fs.atomics?.wait?.(Atomics, '', 0, delay) // fallback
-        // 简单 sleep
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay)
+        await sleep(100 * Math.pow(2, attempt))  // 100ms, 200ms, 400ms
       }
     }
 
@@ -880,7 +929,7 @@ ipcMain.handle('wechat-agent:loadConfig', async () => {
 
 // 微信 Agent: 保存配置
 ipcMain.handle('wechat-agent:saveConfig', async (_event, config: WechatAgentConfig) => {
-  return saveConfig(config)
+  return await saveConfig(config)
 })
 
 // 微信 Agent: 获取群组列表（从 wx sessions）
@@ -1077,12 +1126,32 @@ export function WechatAgentSettings(): React.JSX.Element {
   }
 
   const handleSave = async () => {
+    // 客户端校验
+    if (!config.identity.wxid.trim()) {
+      alert('请填写微信 ID')
+      return
+    }
+    if (config.identity.names.length === 0) {
+      alert('请至少添加一个群昵称')
+      return
+    }
+    if (!config.ai.api_url.trim()) {
+      alert('请填写 AI API URL')
+      return
+    }
+    if (!config.ai.api_key.trim()) {
+      alert('请填写 AI API Key')
+      return
+    }
+
     setSaving(true)
     const result = await window.electron?.invoke('wechat-agent:saveConfig', config)
     setSaving(false)
     if (result?.ok) {
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
+    } else {
+      alert(`保存失败: ${result?.error || '未知错误'}`)
     }
   }
 
@@ -1416,13 +1485,19 @@ function ControlPanel() {
     }
   }, [])
 
-  // ... 在 JSX 中，logs 列表上方添加 alert banner:
-  // {currentAlert && (
-  //   <div className={`alert-banner ${currentAlert.severity}`}>
-  //     <span>{currentAlert.message}</span>
-  //     <button className="close-btn" onClick={() => setCurrentAlert(null)}>×</button>
-  //   </div>
-  // )}
+  // ... 在 ControlPanel 的 JSX 中，logs 列表上方插入 alert banner（取消注释）:
+  return (
+    <div className="control-panel">
+      {/* Alert Banner — 放在最顶部，所有页面都能看到 */}
+      {currentAlert && (
+        <div className={`alert-banner ${currentAlert.severity}`}>
+          <span>{currentAlert.message}</span>
+          <button className="close-btn" onClick={() => setCurrentAlert(null)}>×</button>
+        </div>
+      )}
+      {/* ... 其余 JSX 不变 ... */}
+    </div>
+  )
 ```
 
 - [ ] **Step 2: 提交**
@@ -1472,4 +1547,75 @@ git commit -m "feat: 添加 alert banner 和系统通知"
 
 ```bash
 git push
+```
+
+---
+
+### Task 9: 清理旧的 .env 配置代码
+
+**Files:**
+- Modify: `glue-layer/config.py`
+- Delete: `glue-layer/.env.example`
+- Modify: `glue-layer/.gitignore`
+
+- [ ] **Step 1: 精简 config.py — 只保留 SIGHTFLOW_API_URL 和 WX_POLL_INTERVAL**
+
+```python
+# glue-layer/config.py
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# SightFlow 配置（固定端口 12680）
+SIGHTFLOW_API_URL = os.getenv('SIGHTFLOW_API_URL', 'http://127.0.0.1:12680')
+
+# 轮询间隔（开发/调试用，生产环境从 JSON 配置读取）
+WX_POLL_INTERVAL = int(os.getenv('WX_POLL_INTERVAL', '10'))
+
+# 以下配置已迁移到 JSON 配置文件（%APPDATA%\WeChatAgent\config.json）：
+# - AI_API_KEY / AI_API_URL / AI_MODEL → ai 区块
+# - SELF_WXID / SELF_NAMES → identity 区块
+# - WX_CLI_PATH → advanced 区块
+# - GROUP_NAMES → groups 区块
+```
+
+- [ ] **Step 2: 更新 .env.example 说明配置已迁移**
+
+```bash
+# 删除旧的 .env.example
+rm glue-layer/.env.example
+
+# 创建新的说明文件
+cat > glue-layer/.env.example << 'EOF'
+# 配置已迁移到 SightFlow UI（设置 → 微信 Agent）
+# 配置文件位置：%APPDATA%\WeChatAgent\config.json
+#
+# 以下环境变量仅用于开发/调试：
+# SIGHTFLOW_API_URL=http://127.0.0.1:12680
+# WX_POLL_INTERVAL=10
+EOF
+```
+
+- [ ] **Step 3: 确认 main.py 中没有残留的旧导入**
+
+```bash
+cd D:/code/wexin_driverless/glue-layer
+grep -n "from config import" main.py
+```
+
+应只有 `from config import SIGHTFLOW_API_URL, WX_POLL_INTERVAL`。如果有 SELF_WXID、SELF_NAMES 等残留，删除。
+
+- [ ] **Step 4: 运行测试确认无回归**
+
+```bash
+cd D:/code/wexin_driverless/glue-layer
+D:/miniconda/envs/py3.12/python.exe -m pytest test_config_model.py test_config_watcher.py -v
+```
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add glue-layer/config.py glue-layer/.env.example glue-layer/main.py
+git commit -m "refactor: 清理旧的 .env 配置代码，完成 JSON 配置迁移"
 ```
