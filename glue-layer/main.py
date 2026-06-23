@@ -378,9 +378,18 @@ class WeChatAgent:
             print(f"[WeChatAgent] 已达发送上限 ({MAX_MESSAGES_PER_MINUTE}/{MESSAGE_WINDOW_SECONDS}s)，跳过", flush=True)
             return
 
-        # AI 客户端检查
-        if self.ai_client is None:
-            print("[WeChatAgent] AI 客户端未就绪，跳过", flush=True)
+        # 从配置快照构建 AI 客户端（保证整个消息处理生命周期用同一份配置）
+        if config.resolved_api_key is None:
+            print("[WeChatAgent] API Key 未配置，跳过", flush=True)
+            return
+        try:
+            ai_client = AIClient(
+                api_key=config.resolved_api_key,
+                api_url=config.ai.api_url,
+                model=config.ai.model
+            )
+        except Exception as e:
+            print(f"[WeChatAgent] AI 客户端构建失败: {e}", flush=True)
             return
 
         # 获取联系人名（从 session 获取，因为 history 消息没有 sender_wxid）
@@ -434,8 +443,8 @@ class WeChatAgent:
         # 发送收到消息日志到 SightFlow
         send_log_to_sightflow('receive', content[:50] + '...' if len(content) > 50 else content, target)
 
-        # AI 生成回复
-        reply = self.ai_client.generate_reply(context, target)
+        # AI 生成回复（使用从快照构建的客户端）
+        reply = ai_client.generate_reply(context, target)
 
         if reply:
             # 发送回复日志到 SightFlow

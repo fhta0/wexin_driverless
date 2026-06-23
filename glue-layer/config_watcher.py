@@ -26,7 +26,7 @@ class ConfigWatcher:
                 if new_config is not None:
                     self._config = new_config
                     self._last_mtime = mtime
-                    print(f"[ConfigWatcher] 配置已更新，重新加载", flush=True)
+                    print("[ConfigWatcher] 配置已更新，重新加载", flush=True)
                     return True
                 else:
                     # 加载失败，更新 mtime 避免反复尝试损坏的文件
