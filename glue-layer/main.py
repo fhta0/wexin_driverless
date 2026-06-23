@@ -112,6 +112,7 @@ def cleanup_pid_file():
 # 防刷屏配置
 MAX_MESSAGES_PER_MINUTE = 3  # 每分钟最多回复 3 条
 MESSAGE_WINDOW_SECONDS = 60  # 时间窗口 60 秒
+ECHO_QUIET_SECONDS = 15      # 发送后 15 秒内跳过该联系人消息（防 echo 回环）
 
 
 def check_autopilot_enabled() -> bool:
@@ -166,6 +167,11 @@ class WeChatAgent:
         self._send_times: deque = deque(maxlen=MAX_MESSAGES_PER_MINUTE)
         # 已回复会话时间戳（避免重复回复同一会话的旧消息）
         self._last_reply_ts: Dict[str, int] = {}
+        # 启动时间戳：忽略此时间之前的历史消息
+        self._start_timestamp = int(time.time())
+        # 已发送消息跟踪（防止回环）：记录每个联系人的最后发送时间
+        # 发送后 ECHO_QUIET_SECONDS 秒内跳过该联系人的消息（防 echo）
+        self._last_send_time: Dict[str, float] = {}
 
     def _make_msg_key(self, msg: dict) -> str:
         """生成消息唯一标识：时间戳+发送者+内容hash"""
@@ -196,13 +202,14 @@ class WeChatAgent:
         self._poll_loop()
 
     def _poll_loop(self):
-        """轮询循环"""
+        """轮询循环：使用 wx new-messages 获取新消息"""
         heartbeat_counter = 0
+        mapper_refresh_counter = 0
+        MAPPER_REFRESH_INTERVAL = 60  # 每 60 次轮询（约 5 分钟）刷新一次映射表
         while True:
             try:
                 # 检查自动驾驶状态
                 if not check_autopilot_enabled():
-                    # 自动驾驶禁用时，跳过处理但继续轮询
                     heartbeat_counter += 1
                     if heartbeat_counter >= 12:
                         print("[WeChatAgent] 自动驾驶已禁用，等待启用...", flush=True)
@@ -211,31 +218,26 @@ class WeChatAgent:
                     time.sleep(WX_POLL_INTERVAL)
                     continue
 
-                # 获取未读会话
-                unread_sessions = self._get_unread_sessions()
+                # 获取新消息
+                new_messages = self._get_new_messages()
 
-                if unread_sessions:
-                    # 过滤掉已处理的会话（检查时间戳）
-                    new_sessions = []
-                    for session in unread_sessions:
-                        username = session.get('username', '')
-                        session_timestamp = session.get('timestamp', 0)
-                        last_reply_ts = self._last_reply_ts.get(username, 0)
-                        if session_timestamp > last_reply_ts:
-                            new_sessions.append(session)
-
-                    if new_sessions:
-                        print(f"[WeChatAgent] 发现 {len(new_sessions)} 个未读会话", flush=True)
-                        for session in new_sessions:
-                            self._process_unread_session(session)
+                if new_messages:
+                    print(f"[WeChatAgent] 发现 {len(new_messages)} 条新消息", flush=True)
+                    for msg in new_messages:
+                        self._process_new_message(msg)
 
                 # 心跳日志（每 12 次轮询约 60 秒）
                 heartbeat_counter += 1
                 if heartbeat_counter >= 12:
                     print(f"[WeChatAgent] 轮询中... (已处理 {len(self._processed_keys)} 条消息)", flush=True)
-                    # 发送心跳日志到 SightFlow，确保 UI 显示"已连接"
                     send_log_to_sightflow('heartbeat', f'已处理 {len(self._processed_keys)} 条消息')
                     heartbeat_counter = 0
+
+                # 定期刷新映射表（获取新群名、新联系人等）
+                mapper_refresh_counter += 1
+                if mapper_refresh_counter >= MAPPER_REFRESH_INTERVAL:
+                    self.mapper.refresh()
+                    mapper_refresh_counter = 0
 
                 # 等待下一次轮询
                 time.sleep(WX_POLL_INTERVAL)
@@ -248,78 +250,11 @@ class WeChatAgent:
                 print(f"[WeChatAgent] 轮询异常: {e}", flush=True)
                 time.sleep(WX_POLL_INTERVAL)
 
-    def _get_unread_sessions(self) -> List[dict]:
-        """使用 wx unread 获取有未读消息的会话"""
+    def _get_new_messages(self) -> List[dict]:
+        """使用 wx new-messages 获取自上次检查以来的新消息"""
         try:
             result = subprocess.run(
-                [WX_CLI_PATH, 'unread', '--json', '--filter', 'private,group'],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                timeout=10
-            )
-
-            if result.returncode != 0:
-                print(f"[WeChatAgent] wx unread 失败: {result.stderr}", flush=True)
-                return []
-
-            data = json.loads(result.stdout)
-            sessions = data.get('sessions', [])
-            return sessions
-
-        except Exception as e:
-            print(f"[WeChatAgent] 获取未读会话失败: {e}", flush=True)
-            return []
-
-    def _process_unread_session(self, session: dict):
-        """处理单个未读会话"""
-        username = session.get('username', '')
-        unread_count = session.get('unread', 0)
-        session_timestamp = session.get('timestamp', 0)
-
-        # 防止重复处理同一会话（如果时间戳没变化）
-        last_reply_ts = self._last_reply_ts.get(username, 0)
-        if session_timestamp <= last_reply_ts:
-            return
-
-        print(f"[WeChatAgent] 处理未读会话: {session.get('chat')}, 未读={unread_count}", flush=True)
-
-        # 获取最近的未读消息
-        messages = self._get_recent_messages(username, unread_count)
-
-        # 找到对方发送的最新消息（未回复的）
-        found_other_message = False
-        for msg in reversed(messages):  # 从最新到最旧
-            sender = msg.get('sender', '')
-            msg_key = self._make_msg_key(msg)
-
-            # 跳过已处理的消息
-            if msg_key in self._processed_keys:
-                continue
-
-            # 跳过自己发送的消息（sender == "192"）
-            if sender == '192':
-                self._processed_keys.add(msg_key)
-                continue
-
-            # 找到对方发送的最新未处理消息
-            if sender == '' or sender != '192':
-                self._processed_keys.add(msg_key)
-                self._process_message(msg, session)
-                found_other_message = True
-                break  # 只处理一条最新消息
-
-        # 无论是否找到对方消息，都更新会话时间戳（防止重复检查）
-        # 如果找到对方消息，_process_message 内部会更新 _last_reply_ts
-        # 如果没找到（全是自己发的消息），这里更新防止下次重复检查
-        if not found_other_message:
-            self._last_reply_ts[username] = session_timestamp
-
-    def _get_recent_messages(self, username: str, limit: int) -> List[dict]:
-        """获取会话的最近消息"""
-        try:
-            result = subprocess.run(
-                [WX_CLI_PATH, 'history', username, '--json', '-n', str(limit)],
+                [WX_CLI_PATH, 'new-messages', '--json', '-n', '50'],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
@@ -327,16 +262,63 @@ class WeChatAgent:
             )
 
             if result.returncode != 0:
-                print(f"[WeChatAgent] wx history 失败: {result.stderr}", flush=True)
+                print(f"[WeChatAgent] wx new-messages 失败: {result.stderr}", flush=True)
                 return []
 
             data = json.loads(result.stdout)
             messages = data.get('messages', [])
-            return messages
+            # 只保留私聊和群聊，过滤系统/公众号等
+            return [m for m in messages if m.get('chat_type') in ('private', 'group')]
 
         except Exception as e:
-            print(f"[WeChatAgent] 获取历史消息失败: {e}", flush=True)
+            print(f"[WeChatAgent] 获取新消息失败: {e}", flush=True)
             return []
+
+    def _process_new_message(self, msg: dict):
+        """处理单条新消息（来自 wx new-messages）"""
+        username = msg.get('username', '')
+        sender = msg.get('sender', '')
+        content = msg.get('content', '')
+        msg_type = msg.get('type', '')
+        chat_type = msg.get('chat_type', 'private')
+        chat_name = msg.get('chat', '')
+        timestamp = msg.get('timestamp', 0)
+
+        # 生成消息唯一标识，防重复
+        msg_key = self._make_msg_key(msg)
+        if msg_key in self._processed_keys:
+            return
+        self._processed_keys.add(msg_key)
+
+        # 跳过启动前的历史消息（但已记录 processed_keys 防止重复）
+        if timestamp > 0 and timestamp < self._start_timestamp:
+            return
+
+        # 跳过自己发送的消息
+        if sender == '192' or sender == SELF_WXID:
+            return
+
+        # 跳过自己发送的回复（防止回环）
+        # 发送后 ECHO_QUIET_SECONDS 秒内，跳过该联系人的所有消息
+        # 微信会将我们发送的消息回显为对方发来的，用时间窗口过滤
+        last_send = self._last_send_time.get(username, 0)
+        if last_send and time.time() - last_send < ECHO_QUIET_SECONDS:
+            print(f"[WeChatAgent] 静默期跳过 (距发送 {time.time() - last_send:.1f}s): {username}", flush=True)
+            return
+
+        # 跳过系统消息
+        if msg_type == '系统':
+            return
+
+        # 构造 session 字典（复用 _process_message 逻辑）
+        session = {
+            'username': username,
+            'chat_type': chat_type,
+            'chat': chat_name,
+            'timestamp': timestamp
+        }
+
+        self._process_message(msg, session)
 
     def _process_message(self, msg: dict, session: dict):
         """处理单条消息"""
@@ -406,6 +388,9 @@ class WeChatAgent:
         if reply:
             # 发送回复日志到 SightFlow
             send_log_to_sightflow('reply', reply[:50] + '...' if len(reply) > 50 else reply, target)
+
+            # 记录发送时间（防止 echo 回环：发送后 N 秒内跳过该联系人消息）
+            self._last_send_time[username] = time.time()
 
             # 加入发送队列
             self.message_queue.enqueue(target, reply, context)

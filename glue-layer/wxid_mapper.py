@@ -135,8 +135,23 @@ class WxidMapper:
         return self._name_map.get(wxid, wxid)
 
     def get_group_name(self, room_id: str) -> str:
-        """获取群名"""
-        return self._group_map.get(room_id, room_id)
+        """获取群名（支持按需查找：缓存未命中时实时查询 wx history）"""
+        if room_id in self._group_map:
+            cached = self._group_map[room_id]
+            # 如果缓存的是 room_id 本身（兜底值），尝试重新查找
+            if cached != room_id:
+                return cached
+
+        # 缓存未命中 或 缓存为兜底值 → 按需查找
+        group_name = self._extract_group_name_from_history(room_id)
+        if group_name:
+            self._group_map[room_id] = group_name
+            print(f"[WxidMapper] 按需查到群名: {room_id} → {group_name}", flush=True)
+            return group_name
+
+        # 仍然找不到，兜底用 room_id
+        self._group_map[room_id] = room_id
+        return room_id
 
     def translate_message(self, msg: dict) -> tuple:
         """

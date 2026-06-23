@@ -41,5 +41,11 @@ ScreenShot*.png
 
 # Sub-projects (have their own git repos)
 sightflow-desktop-agent/
-wx-cli/glue-layer/.glue-layer.pid
+wx-cli/
+
+# Glue-layer runtime files
+glue-layer/*.lock
+glue-layer/*.pid
+glue-layer/*_tmp.json
+
 *.exe
