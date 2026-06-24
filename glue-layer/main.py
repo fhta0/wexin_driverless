@@ -33,8 +33,9 @@ os.makedirs(_log_dir, exist_ok=True)
 logging.basicConfig(
     handlers=[
         logging.StreamHandler(),  # 保留 stdout 输出
-        logging.FileHandler(
+        RotatingFileHandler(
             os.path.join(_log_dir, 'glue-layer.log'),
+            maxBytes=10*1024*1024, backupCount=5,
             encoding='utf-8'
         )
     ],
