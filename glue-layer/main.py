@@ -5,6 +5,9 @@ import time
 import requests
 import sys
 import os
+import argparse
+import logging
+from logging.handlers import RotatingFileHandler
 from typing import List, Optional, Set, Dict
 from collections import deque
 
@@ -13,16 +16,44 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
-from config import SIGHTFLOW_API_URL, WX_POLL_INTERVAL
+
+def get_data_dir():
+    """获取数据目录（PyInstaller --onefile 下 sys._MEIPASS 是临时目录，不可写）"""
+    if sys.platform == 'win32':
+        appdata = os.environ.get('APPDATA', '')
+        if appdata:
+            return os.path.join(appdata, 'WeChatAgent')
+    return os.path.join(os.path.expanduser('~'), '.wechat-agent')
+
+
+# 日志配置：写入 %APPDATA%\WeChatAgent\logs\
+_log_dir = os.path.join(get_data_dir(), 'logs')
+os.makedirs(_log_dir, exist_ok=True)
+
+logging.basicConfig(
+    handlers=[
+        logging.StreamHandler(),  # 保留 stdout 输出
+        logging.FileHandler(
+            os.path.join(_log_dir, 'glue-layer.log'),
+            encoding='utf-8'
+        )
+    ],
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger('WeChatAgent')
+
+import config as _config_module
+from config import WX_POLL_INTERVAL
 from config_watcher import ConfigWatcher
 from config_model import AgentConfig, get_config_path
 from wxid_mapper import WxidMapper
 from ai_client import AIClient
 from message_queue import MessageQueue
 
-# 进程互斥：PID 文件路径
-PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.glue-layer.pid')
-LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.glue-layer.lock')
+# 进程互斥：PID 文件路径（放在 %APPDATA%\WeChatAgent\ 下，兼容 PyInstaller）
+PID_FILE = os.path.join(get_data_dir(), '.glue-layer.pid')
+LOCK_FILE = os.path.join(get_data_dir(), '.glue-layer.lock')
 
 
 # 平台抽象：文件锁 + 进程存活检测
@@ -79,6 +110,8 @@ def check_single_instance() -> bool:
     """检查是否已有实例运行，使用文件锁确保原子性"""
     lock_fd = None
     try:
+        # 确保数据目录存在
+        os.makedirs(get_data_dir(), exist_ok=True)
         # 尝试获取文件锁（非阻塞）
         lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
         if not _try_lock(lock_fd):
@@ -146,16 +179,16 @@ def check_autopilot_enabled() -> bool:
     """检查 SightFlow 自动驾驶状态"""
     try:
         response = requests.get(
-            f"{SIGHTFLOW_API_URL}/skill/autopilot",
+            f"{_config_module.SIGHTFLOW_API_URL}/skill/autopilot",
             timeout=5
         )
         if response.status_code == 200:
             data = response.json()
-            return data.get('enabled', True)
-        return True  # 默认启用
+            return data.get('enabled', False)  # 默认关闭
+        return False  # 请求失败时默认关闭
     except Exception as e:
         print(f"[WeChatAgent] 检查自动驾驶状态失败: {e}", flush=True)
-        return True  # 出错时默认启用
+        return False  # 出错时默认关闭
 
 
 def send_log_to_sightflow(log_type: str, content: str, contact: str = None):
@@ -170,7 +203,7 @@ def send_log_to_sightflow(log_type: str, content: str, contact: str = None):
             log_entry["contact"] = contact
 
         response = requests.post(
-            f"{SIGHTFLOW_API_URL}/skill/log",
+            f"{_config_module.SIGHTFLOW_API_URL}/skill/log",
             json=log_entry,
             timeout=5
         )
@@ -184,14 +217,18 @@ def send_log_to_sightflow(log_type: str, content: str, contact: str = None):
 class WeChatAgent:
     """微信自动回复 Agent 主类"""
 
-    def __init__(self):
+    def __init__(self, config_path_override=None, wx_cli_path_override=None):
         # 配置监听器
-        self._config_watcher = ConfigWatcher(get_config_path())
+        cfg_path = config_path_override or get_config_path()
+        self._config_watcher = ConfigWatcher(cfg_path)
         self._config_watcher.check_for_updates()  # 首次加载
 
-        # 从配置获取 wx_cli_path
+        # 从配置获取 wx_cli_path（CLI 参数优先）
         config = self._config_watcher.get_config()
-        wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
+        if wx_cli_path_override:
+            wx_cli_path = wx_cli_path_override
+        else:
+            wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
 
         self.mapper = WxidMapper(wx_cli_path)
         # 不再需要校验 AI 配置，因为 AI 调用统一走 SightFlow Provider
@@ -201,6 +238,7 @@ class WeChatAgent:
         self._last_reply_ts: Dict[str, int] = {}
         self._start_timestamp = int(time.time())
         self._last_send_time: Dict[str, float] = {}
+        self._new_messages_state: Optional[dict] = None
 
     def _validate_ai_config(self) -> None:
         """已废弃：AI 配置统一走 SightFlow Provider，不再需要校验"""
@@ -216,7 +254,7 @@ class WeChatAgent:
                 "timestamp": int(time.time())
             }
             requests.post(
-                f"{SIGHTFLOW_API_URL}/skill/alert",
+                f"{_config_module.SIGHTFLOW_API_URL}/skill/alert",
                 json=alert,
                 timeout=5
             )
@@ -310,8 +348,11 @@ class WeChatAgent:
         config = self._config_watcher.get_config()
         wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
         try:
+            # Build command
+            cmd = [wx_cli_path, 'new-messages', '--json', '-n', '50']
+
             result = subprocess.run(
-                [wx_cli_path, 'new-messages', '--json', '-n', '50'],
+                cmd,
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
@@ -324,6 +365,12 @@ class WeChatAgent:
 
             data = json.loads(result.stdout)
             messages = data.get('messages', [])
+
+            # Save cursor state for future use
+            new_state = data.get('new_state')
+            if new_state:
+                self._new_messages_state = new_state
+
             # 只保留私聊和群聊，过滤系统/公众号等
             return [m for m in messages if m.get('chat_type') in ('private', 'group')]
 
@@ -468,7 +515,7 @@ class WeChatAgent:
     def _is_mentioned(self, content: str, config: AgentConfig) -> bool:
         """检测群消息中是否 @ 了自己（使用配置快照）"""
         if not config.identity.names:
-            return True
+            return False  # 空数组表示不检测 @提及，群聊中不回复
 
         for name in config.identity.names:
             if f"@{name}" in content:
@@ -483,7 +530,7 @@ class WeChatAgent:
             self._send_times.append(time.time())
 
             response = requests.post(
-                f"{SIGHTFLOW_API_URL}/skill/send-message",
+                f"{_config_module.SIGHTFLOW_API_URL}/skill/send-message",
                 json={"contact": contact, "message": message},
                 timeout=30
             )
@@ -507,13 +554,35 @@ class WeChatAgent:
             print(f"[WeChatAgent] 发送异常: {e}", flush=True)
             return False
 
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='WeChat Agent glue-layer')
+    parser.add_argument('--wx-cli-path', dest='wx_cli_path',
+                        help='wx-cli 可执行文件路径（覆盖 config）')
+    parser.add_argument('--sightflow-port', dest='sightflow_port', type=int, default=None,
+                        help='SightFlow API 端口（覆盖默认 12680）')
+    parser.add_argument('--config', dest='config_path',
+                        help='配置文件路径（默认 %APPDATA%\\WeChatAgent\\config.json）')
+    return parser.parse_args()
+
+
 def main():
+    # 解析命令行参数
+    args = parse_args()
+
+    # 应用 --sightflow-port 覆盖
+    if args.sightflow_port is not None:
+        _config_module.SIGHTFLOW_API_URL = f'http://127.0.0.1:{args.sightflow_port}'
+
     # 进程互锁检查
     if not check_single_instance():
         sys.exit(1)
 
     try:
-        agent = WeChatAgent()
+        agent = WeChatAgent(
+            config_path_override=args.config_path,
+            wx_cli_path_override=args.wx_cli_path,
+        )
         agent.start()
     finally:
         cleanup_pid_file()

@@ -4,8 +4,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# SightFlow 配置（固定端口 12680）
-SIGHTFLOW_API_URL = os.getenv('SIGHTFLOW_API_URL', 'http://127.0.0.1:12680')
+# SightFlow 配置（固定端口 12680，支持环境变量覆盖）
+SIGHTFLOW_API_URL = os.getenv('SIGHTFLOW_API_URL_OVERRIDE',
+                    os.getenv('SIGHTFLOW_API_URL', 'http://127.0.0.1:12680'))
 
 # 轮询间隔（开发/调试用，生产环境从 JSON 配置读取）
 WX_POLL_INTERVAL = int(os.getenv('WX_POLL_INTERVAL', '10'))
