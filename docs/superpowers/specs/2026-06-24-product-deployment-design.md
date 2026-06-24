@@ -198,7 +198,7 @@ glue-layer 定时轮询
     ├─ subprocess.run(['wx', 'new-messages', '--json'])
     │       └─ wx-cli 内部连 Named Pipe → daemon → 返回新消息
     │
-    ├─ 过滤（chat_type、self-send、@检测）+ 限速（per-contact 3条/分钟）
+    ├─ 过滤（chat_type、self-send、@检测）+ 限速（全局 3条/分钟）
     │
     ├─ POST /skill/generate-reply → SightFlow 调用 Provider 生成回复
     │
@@ -237,13 +237,15 @@ glue-layer 定时轮询
 ### 3.4 wx-cli 通信机制
 
 **wx-cli 不使用 TCP 端口**，而是使用：
+**wx-cli 通信机制**：
 - **Windows**: Named Pipe `\\.\pipe\wx-cli`
-- **Linux/macOS**: Unix Domain Socket `~/.wx-cli/wx-cli.sock`
+- **Linux/macOS**: Unix Domain Socket `~/.wx-cli/wx-cli.sock`（Windows 上对应 `%USERPROFILE%\.wx-cli\`）
 
 glue-layer 通过 `subprocess.run(['wx', 'sessions', ...])` 调用 wx-cli，wx 客户端内部自动连接 named pipe/UDS。**不存在端口冲突/递增问题**。
 
 **wx-cli 首次初始化**：
 - wx-cli 有自己的配置文件 `~/.wx-cli/config.json`（包含 `db_path`、`key`）
+  - Windows 上路径为 `%USERPROFILE%\.wx-cli\config.json`
 - 首次启动时自动探测 WeChat DB 路径和解密密钥
 - 如果自动探测失败，用户需要手动运行 `wx init --wx-dir <path>` 指定 WeChat 数据目录
 - SightFlow 在首次启动引导中检测 wx-cli 是否已初始化，未初始化则提供引导
@@ -288,6 +290,7 @@ glue-layer 通过 `subprocess.run(['wx', 'sessions', ...])` 调用 wx-cli，wx �
 2. 检查 %APPDATA%\WeChatAgent\config.json 是否存在
     ├─ 不存在 → 创建最小可用配置：
     │   {
+    │     "version": 1,
     │     "identity": { "wxid": "<自动获取>", "names": [] },
     │     "groups": { "monitor": [] },
     │     "advanced": { "wx_cli_path": "<resources/wx-cli/wx.exe 绝对路径>" }
@@ -395,33 +398,36 @@ SightFlow 自动启动各组件 → 开始监控消息
 
 ```json
 {
+  "version": 1,
   "identity": {
     "wxid": "your_wxid",
     "names": ["昵称1", "昵称2"]
   },
   "groups": {
-    "monitor": ["群聊1", "群聊2"]
+    "monitor": [
+      { "room_id": "xxx@chatroom", "name": "群聊1" },
+      { "room_id": "yyy@chatroom", "name": "群聊2" }
+    ]
   },
   "advanced": {
-    "wx_cli_path": "",
-    "rate_limit_per_contact": 3,
-    "echo_quiet_seconds": 15
+    "wx_cli_path": ""
   }
 }
 ```
 
 **字段说明**：
+- `version`: 配置版本号（必填，缺失时 `config_model.py` 抛 `ValueError`）。当前唯一支持值为 `1`
 - `identity.wxid`: 用户自己的微信 ID，用于过滤自己发送的消息（**需实现 `wx whoami` 后自动获取，当前需手动填写**）
 - `identity.names`: 用户昵称列表，用于检测群聊中 @自己的情况。**空数组表示不检测 @提及，群聊中不回复**（防止首次配置前全量回复）
-- `groups.monitor`: 需要监控的群聊名称列表（存储群名，运行时通过 `WxidMapper.get_room_id_by_name()` 反查 room_id）
+  - ⚠️ 当前代码行为：空 names 时 `_is_mentioned` 返回 `True`（全量回复）。MVP 前需修改为返回 `False`（见 §8.2 修改要求 2）
+- `groups.monitor`: 需要监控的群聊列表，存储 `{room_id, name}` 对象数组。UI 让用户从群列表勾选，保存时同时存储 room_id 和 name。room_id 是稳定标识（如 `xxx@chatroom`），name 用于 UI 展示。运行时直接使用 room_id 定位群聊
 - `advanced.wx_cli_path`: wx-cli 可执行文件路径（留空则使用默认路径，CLI 参数 `--wx-cli-path` 优先）
-- `advanced.rate_limit_per_contact`: **每个联系人/群**每分钟最大回复数（per-contact 限速，避免一个群占用全部配额）
-- `advanced.echo_quiet_seconds`: 发送消息后的静默期（防止处理自己发送的消息）
 
-**限速策略**：
-- 采用 per-contact 限速：每个联系人/群独立计算 3条/分钟
-- 10 个群各自 3条/分钟，而非全局共享 3条/分钟
-- 实现：`MessageQueue` 中维护 `Dict[contact_id, Deque[timestamp]]` 而非全局队列
+**限速策略**（MVP 阶段）：
+- MVP 使用**全局限速**：所有联系人/群共享 3条/分钟
+- 实现：`self._send_times` 是单一 `Deque[timestamp]`（`main.py:483`），所有联系人共享
+- **后续版本**改为 per-contact 限速：每个联系人/群独立 3条/分钟
+- `advanced` 中不存储 `rate_limit_per_contact` / `echo_quiet_seconds`——这些值在代码中硬编码（`main.py:140-142`），后续版本再考虑可配置化
 
 ### 5.3 配置编辑方式
 
@@ -470,8 +476,9 @@ SightFlow 检测到进程退出
 - **glue-layer 日志**: `%APPDATA%\WeChatAgent\logs\glue-layer.log`
   - **实现要求**：glue-layer 需添加 `logging` 配置（`RotatingFileHandler`），输出到指定路径
   - **PyInstaller 注意**：`--onefile` 模式下 `sys._MEIPASS` 是临时目录，日志必须写入 `%APPDATA%`，不能写入程序目录
-- **wx-cli 日志**: `%APPDATA%\WeChatAgent\logs\wx-cli.log`
-  - wx-cli daemon 需支持 `--log-file` 参数指定日志路径
+- **wx-cli 日志**: 
+  - **MVP 阶段**：保持默认路径 `~/.wx-cli/daemon.log`（`%USERPROFILE%\.wx-cli\daemon.log`），wx-cli 已有此机制（`transport.rs:126` 的 `config::log_path()`）
+  - **后续优化**：如需统一到 `%APPDATA%\WeChatAgent\logs\wx-cli.log`，wx-cli daemon 需支持 `--log-file` 参数或修改默认日志路径配置
 - **诊断包导出**: UI 提供"导出诊断包"按钮（打包所有日志 + 配置 + 系统信息）
   - **敏感信息 redact 要求**：
     - API Key 永不写入日志（`ai_client.py` 的 `requests` 调用不应记录 headers）
@@ -550,15 +557,13 @@ pyinstaller --onefile \
   --hidden-import=win32process \
   --hidden-import=win32api \
   --hidden-import=win32con \
-  --add-data "config_model.py;." \
-  --add-data "wxid_mapper.py;." \
   main.py --name glue-layer
 # 产出: dist/glue-layer.exe
 ```
 
 **注意事项**：
 - `--hidden-import` 确保 native 扩展被打包（cryptography、pywin32 相关模块）
-- `--add-data` 确保所有 Python 模块被包含
+- Python 模块（`config_model.py`、`wxid_mapper.py` 等）被 `main.py` 直接 `import`，PyInstaller 自动检测并打包，**不需要 `--add-data`**（`--add-data` 用于非 Python 资源文件）
 - DPAPI 加密需要 `win32crypt`、`win32security`
 - `wxid_mapper.py` 需要 `win32gui`、`win32process`
 
@@ -609,6 +614,17 @@ pyinstaller --onefile \
    ```python
    if process_name and process_name.lower().endswith('wechat.exe'):
        ...
+   ```
+
+6. **CLI 参数解析**：新增 `argparse` 支持（当前 `main.py` 无 CLI 参数解析）
+   ```python
+   import argparse
+   
+   parser = argparse.ArgumentParser(description='WeChat Agent glue-layer')
+   parser.add_argument('--wx-cli-path', help='wx-cli 可执行文件路径（覆盖 config）')
+   parser.add_argument('--sightflow-port', type=int, default=12680, help='SightFlow API 端口')
+   parser.add_argument('--config', help='配置文件路径（默认 %APPDATA%\\WeChatAgent\\config.json）')
+   args = parser.parse_args()
    ```
 
 ### 8.3 SightFlow 集成
@@ -675,11 +691,29 @@ extraResources:
 
 ### 阶段 1：基础打包（MVP）
 
+**🔴 P0 安全修复**（阻塞发布，必须先完成）：
+- 修复 Skill Server CORS 漏洞（§12.7）：验证 Origin header 或使用 secret token（推荐方案 1）
+
+**代码缺陷修复**（§12.6）：
+- `generateReply` API Key bug（`index.ts:956`）
+- autopilot 状态持久化（`skill-server.ts:118` → electron-store）
+- `wx whoami` 命令实现（MVP 前置依赖）
+- identity.names 空数组行为（`main.py:470` → return False）
+- `check_autopilot_enabled` fail-open（`main.py:158` → return False）
+- PID/LOCK/日志路径修复（PyInstaller 兼容）
+- glue-layer CLI 参数解析（`--wx-cli-path`、`--sightflow-port`、`--config`）
+
+**打包与集成**：
 - 实现 wx-cli 和 glue-layer 的打包脚本
 - 修改 SightFlow 以嵌入这些组件
-- 实现基本的进程管理（启动、监控）
+- 实现 process-manager.ts（仅管理 glue-layer）
 - 实现微信版本检测和安装
 - 生成 NSIS 安装包
+- 发送消息互斥锁
+
+**测试**（§12.8）：
+- glue-layer 核心逻辑单元测试（消息处理、限速、去重、@检测）
+- 集成测试（glue-layer ↔ wx-cli mock）
 
 ### 阶段 2：UI 完善
 
@@ -690,6 +724,8 @@ extraResources:
 
 ### 阶段 3：高级功能（可选）
 
+- 限速策略从全局改为 per-contact
+- `rate_limit_per_contact` / `echo_quiet_seconds` 配置化
 - 自动更新功能
 - 消息过滤规则
 - 自定义回复模板
@@ -730,8 +766,9 @@ extraResources:
 
 - [x] **groups.monitor 存储格式？**
   - ✅ `Array<{ room_id: string; name: string }>`（非字符串数组）
-  - `config_model.py:20-26` 和 `wechat-agent-config.ts:23` 都定义为此结构
-  - UI 让用户选群名，运行时通过 `WxidMapper.get_room_id_by_name()` 反查 room_id
+  - `config_model.py:18-26` 定义 `GroupEntry(room_id, name)`，校验器要求每项都有 `room_id` 和 `name`
+  - `wechat-agent-config.ts:23` 同样定义 `monitor: Array<{ room_id: string; name: string }>`
+  - UI 让用户从群列表勾选，保存时同时存储 room_id 和 name。运行时直接使用 room_id 定位群聊
 
 - [x] **process-manager.ts 是否已实现？**
   - ❌ 未实现。MVP 首要实现任务，需从零开发
@@ -795,9 +832,9 @@ extraResources:
 4. **进程重启策略**：指数退避（2s → 5s → 10s）+ 游标重置 + Windows Job Object 级联退出
 5. **卸载数据保留**：保留 wx-cli 游标，避免重装后重复处理历史消息
 6. **安装路径**：`%LOCALAPPDATA%\Programs\WeChatAgent\`（无需管理员权限）
-7. **限速策略**：per-contact（每个联系人/群独立 3条/分钟）
+7. **限速策略**：MVP 阶段使用全局限速（所有联系人共享 3条/分钟），后续版本改为 per-contact
 8. **identity.wxid 获取**：`wx whoami` 命令**需新增实现**（当前未实现），UI 自动检测按钮已接线等待命令就绪
-9. **groups.monitor schema**：存储群名，运行时反查 room_id
+9. **groups.monitor schema**：存储 `{room_id, name}` 对象数组（非字符串数组），UI 勾选群时同时保存 room_id 和 name
 10. **identity.names 空数组行为**：不回复（而非全量回复）
 11. **autopilot 检查失败**：默认关闭（而非启用）
 12. **消息持久化**：MVP 不持久化，显式标注"崩溃时丢失排队消息"
@@ -922,9 +959,11 @@ extraResources:
 - `/skill/generate-reply` — 可消耗用户的 API Key 额度
 
 **修复方案**（任选其一）：
-1. **验证 Origin header**：只允许 SightFlow 自身的 origin（`file://*` / `app://*`）
-2. **使用 secret token**：请求 header 加 `X-SightFlow-Token`，服务端验证
-3. **改用 Unix socket / named pipe**：完全不暴露 HTTP 端口（需改 glue-layer 调用方式）
+1. **✅ 推荐：验证 Origin header** — 只允许 SightFlow 自身的 origin（`file://*` / `app://*`）。MVP 阶段最简单、改动最小（仅改 CORS header 逻辑），无需修改 glue-layer
+2. **使用 secret token** — 请求 header 加 `X-SightFlow-Token`，服务端验证。更安全但需改 glue-layer 和 glue-layer 的 API 调用
+3. **改用 Unix socket / named pipe** — 完全不暴露 HTTP 端口。最安全但需改 glue-layer 调用方式，工作量大
+
+**MVP 推荐方案 1**，理由：改动仅在 `skill-server.ts` 一个文件、不依赖外部组件、能阻止浏览器跨域攻击（主要威胁向量）。
 
 **优先级**：**P0（阻塞产品发布）**
 
@@ -938,7 +977,7 @@ glue-layer 测试现状：
 
 **未测试的关键路径**：
 - 消息去重（`_make_msg_key`）
-- 限速逻辑（per-contact 3 条/分钟）
+- 限速逻辑（全局 3 条/分钟）
 - Echo 静默期（15 秒）
 - @mention 检测
 - 消息队列串行化
@@ -957,7 +996,7 @@ glue-layer 性能参数：
 - 发送超时：30 秒
 - 消息队列：串行处理，1 秒间隔
 
-**实际吞吐量**：~3-6 条消息/分钟（受 per-contact 3 条/分钟限速约束）
+**实际吞吐量**：~3 条消息/分钟（受全局 3 条/分钟限速约束，所有联系人共享配额）
 
 **延迟**：新消息检测延迟最多 10 秒
 
