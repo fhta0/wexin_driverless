@@ -775,6 +775,16 @@ extraResources:
   - **MVP 建议**：评估将 glue-layer 核心逻辑做成 SightFlow 的 `WechatAgentPoller` 模块的可行性
   - glue-layer 作为"高级/开发者模式"保留给想自部署的用户
 
+- [x] **Skill Server CORS 是否安全？**
+  - ❌ **CRITICAL 安全漏洞**。`skill-server.ts:130, 442` 设置 `Access-Control-Allow-Origin: *`
+  - 任意恶意网站可通过浏览器跨域调用 Skill Server API（发送消息、控制引擎、消耗 API 额度）
+  - **P0 阻塞产品发布**。修复方案：验证 Origin header / secret token / 改用 named pipe
+
+- [x] **glue-layer 测试覆盖情况？**
+  - ❌ 核心逻辑（main.py、ai_client.py、message_queue.py、wxid_mapper.py）**无测试**
+  - 仅 config_model.py 和 config_watcher.py 有测试
+  - MVP 发布前需补充单元测试（消息处理、限速、去重）和集成测试
+
 ---
 
 ## 11. 已确认的设计决策
@@ -805,6 +815,8 @@ extraResources:
 24. **generateReply API Key**：已知 bug（用了 vision key），需改用 chatProvider key
 25. **glue-layer 架构讨论**：MVP 阶段评估合入 SightFlow 的可行性，减少打包复杂度
 26. **process-manager.ts 范围缩小**：仅需管理 glue-layer（wx-cli 自动启动）
+27. **Skill Server CORS**：`Access-Control-Allow-Origin: *` 是 CRITICAL 安全漏洞，P0 阻塞发布
+28. **测试覆盖**：glue-layer 核心逻辑无测试，MVP 前需补充单元测试和集成测试
 
 ---
 
@@ -891,3 +903,62 @@ extraResources:
 | PID/LOCK 路径 PyInstaller 失效 | `main.py:24-25` | 单实例锁失效 | 改为 `%APPDATA%\WeChatAgent\` |
 | 日志路径 PyInstaller 失效 | `wxid_mapper.py:32` | 日志写到临时目录 | 统一到 `%APPDATA%\WeChatAgent\logs\` |
 | glue-layer 不维护 new-messages 游标 | `main.py:308-332` | 每次拉 24h 全量消息 | 保存 `new_state` 下次传入 |
+
+### 12.7 🔴 CRITICAL：Skill Server CORS 安全漏洞
+
+**问题**：`skill-server.ts:130, 442` 设置 `Access-Control-Allow-Origin: *`，允许任意网站跨域调用 Skill Server API。
+
+**攻击场景**：
+1. 用户运行 SightFlow（autopilot 启用）
+2. 用户在浏览器打开恶意网站
+3. 恶意网站执行 `fetch('http://127.0.0.1:12680/skill/send-message', { method: 'POST', body: ... })`
+4. CORS `*` 允许此跨域请求
+5. SightFlow 通过 WeChat RPA 发送恶意消息
+
+**影响范围**：
+- `/skill/send-message` — 任意网站可发送任意 WeChat 消息
+- `/skill/autopilot` POST — 可启用/禁用 autopilot
+- `/skill/start` / `/skill/pause` — 可控制引擎状态
+- `/skill/generate-reply` — 可消耗用户的 API Key 额度
+
+**修复方案**（任选其一）：
+1. **验证 Origin header**：只允许 SightFlow 自身的 origin（`file://*` / `app://*`）
+2. **使用 secret token**：请求 header 加 `X-SightFlow-Token`，服务端验证
+3. **改用 Unix socket / named pipe**：完全不暴露 HTTP 端口（需改 glue-layer 调用方式）
+
+**优先级**：**P0（阻塞产品发布）**
+
+### 12.8 测试覆盖要求
+
+glue-layer 测试现状：
+- ✅ `config_model.py` — 有 `test_config_model.py`
+- ✅ `config_watcher.py` — 有 `test_config_watcher.py`
+- ❌ `main.py`（核心逻辑）— **无测试**
+- ❌ `ai_client.py`、`message_queue.py`、`wxid_mapper.py` — 无测试
+
+**未测试的关键路径**：
+- 消息去重（`_make_msg_key`）
+- 限速逻辑（per-contact 3 条/分钟）
+- Echo 静默期（15 秒）
+- @mention 检测
+- 消息队列串行化
+- 配置快照 deepcopy
+
+**MVP 发布前需补充的测试**：
+- **单元测试**：main.py 核心逻辑（消息处理、限速、去重、@检测）
+- **集成测试**：glue-layer ↔ wx-cli 交互（mock wx-cli daemon）
+- **端到端测试**：完整消息接收 → AI 生成 → 发送流程（可选，后续迭代）
+
+### 12.9 性能特征
+
+glue-layer 性能参数：
+- 轮询间隔：10 秒（`WX_POLL_INTERVAL`，可配置）
+- AI 调用超时：30 秒
+- 发送超时：30 秒
+- 消息队列：串行处理，1 秒间隔
+
+**实际吞吐量**：~3-6 条消息/分钟（受 per-contact 3 条/分钟限速约束）
+
+**延迟**：新消息检测延迟最多 10 秒
+
+对于微信自动回复场景，性能可接受，不是瓶颈。
