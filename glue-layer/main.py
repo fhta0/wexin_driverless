@@ -305,19 +305,33 @@ class WeChatAgent:
             print(f"[WeChatAgent] 检查 daemon 状态失败: {e}", flush=True)
 
         # daemon 未运行，需要启动
+        # 使用一个实际的命令来触发 daemon 自动启动（daemon status 不会触发启动）
         print("[WeChatAgent] 启动 wx-daemon...", flush=True)
         send_log_to_sightflow('info', '正在启动 wx-daemon...')
 
         try:
-            # 触发 daemon 启动：执行一个简单的命令，daemon 会自动启动
+            # 使用 wx contacts --limit 0 触发 daemon 启动
+            # 这个命令会调用 transport::send()，内部会调用 ensure_daemon()
             # 使用较长的超时时间（30秒），因为首次启动可能需要初始化数据库等
             result = subprocess.run(
-                [self._wx_cli_path, 'daemon', 'status'],
+                [self._wx_cli_path, 'contacts', '--json', '--limit', '0'],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
                 timeout=30
             )
+
+            if result.returncode != 0:
+                # 命令失败，检查是否是因为没有运行 wx init
+                stderr = result.stderr.lower()
+                if '未初始化' in stderr or 'config' in stderr or 'db_dir' in stderr:
+                    print("[WeChatAgent] wx-cli 未初始化，请先运行: wx init", flush=True)
+                    send_log_to_sightflow('error', 'wx-cli 未初始化，请运行 wx init')
+                    return False
+                else:
+                    print(f"[WeChatAgent] wx-daemon 启动失败: {result.stderr}", flush=True)
+                    send_log_to_sightflow('error', f'wx-daemon 启动失败: {result.stderr[:100]}')
+                    return False
 
             # 等待 daemon 完全就绪
             time.sleep(1)
