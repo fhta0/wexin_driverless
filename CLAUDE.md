@@ -28,7 +28,7 @@ wx-cli (daemon)  ──stdout JSON──▶  glue-layer  ──HTTP POST──�
 1. `wx new-messages --json` yields incremental private/group messages since last check.
 2. `glue-layer/main.py` filters echo (self-sends, quiet window), rate-limits (3/min), detects `@` in groups, calls the configured LLM for a reply, then enqueues it.
 3. `MessageQueue` dispatches serially to `POST http://127.0.0.1:12680/skill/send-message`, which SightFlow executes via keyboard/mouse RPA against the WeChat window.
-4. SightFlow also exposes `/skill/autopilot` (enable/disable), `/skill/log` (UI log stream), `/skill/start`, `/skill/pause`, `/skill/status`.
+4. SightFlow also exposes `/skill/autopilot` (enable/disable, defaults to enabled), `/skill/log` (UI log stream), `/skill/logs` (GET — returns buffered history, last 500 entries), `/skill/start`, `/skill/pause`, `/skill/status`, `/skill/generate-reply` (AI text reply via configured provider).
 
 ## Per-Subproject Commands
 
@@ -79,6 +79,8 @@ Config is in JSON file (`%APPDATA%\WeChatAgent\config.json`), managed via SightF
 - **Biz (公众号文章)** live in separate `biz_message_*.db` shards, queried via `wx biz-articles`, not `history`/`search`.
 - **SightFlow skill server** binds `127.0.0.1:12680` (falls back to `12681`). Defined in `src/main/skill-server.ts`. Glue-layer depends on this being up.
 - **Settings persistence** in SightFlow uses `electron-store`; legacy shapes are migrated by `normalizeSettings()`. Provider Hub URL is `https://sightflow.dev/provider-hub.json` (override via `SIGHTFLOW_PROVIDER_HUB_URL`).
+- **glue-layer log fallback**: `send_log_to_sightflow()` failures print to stdout (`[WeChatAgent][log:<type>] <content>`) so ProcessManager can forward via IPC — logs are never silently dropped.
+- **wx_cli_path consistency**: `_get_new_messages()` uses `self._wx_cli_path` (set from CLI arg `--wx-cli-path` in `__init__`), not `config.advanced.wx_cli_path`. This ensures the bundled wx.exe path passed by ProcessManager is always used.
 - **WeChatWin_4.1.9.exe** is a tracked binary at the repo root — treat it as opaque payload, don't try to diff or grep it.
 
 ## Reading Order

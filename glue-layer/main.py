@@ -1,4 +1,19 @@
 # glue-layer/main.py
+#
+# 微信自动回复粘合层：连接 wx-cli（消息监控）和 SightFlow（消息发送/AI 回复）。
+#
+# 数据流：
+#   wx-cli (wx new-messages) → 轮询 → 过滤/限速/@检测 → POST /skill/generate-reply
+#   → AI 回复 → POST /skill/send-message → SightFlow RPA 发送
+#
+# 日志可靠性：
+#   send_log_to_sightflow() 通过 POST /skill/log 发送结构化日志。
+#   失败时输出到 stdout（[WeChatAgent][log:<type>] <content>），
+#   由 ProcessManager 通过 IPC 转发到 UI，日志不会丢失。
+#
+# 配置：
+#   %APPDATA%\WeChatAgent\config.json（由 SightFlow UI 管理）
+#   CLI 参数 --wx-cli-path 优先于 config 中的 advanced.wx_cli_path
 import subprocess
 import json
 import time
@@ -193,7 +208,7 @@ def check_autopilot_enabled() -> bool:
 
 
 def send_log_to_sightflow(log_type: str, content: str, contact: str = None):
-    """发送日志到 SightFlow UI"""
+    """发送日志到 SightFlow UI（失败时输出到 stdout，不静默吞掉）"""
     try:
         log_entry = {
             "type": log_type,
@@ -209,10 +224,10 @@ def send_log_to_sightflow(log_type: str, content: str, contact: str = None):
             timeout=5
         )
         if response.status_code != 200:
-            print(f"[WeChatAgent] 发送日志失败: {response.status_code}", flush=True)
+            print(f"[WeChatAgent] 发送日志失败: HTTP {response.status_code}", flush=True)
     except Exception as e:
-        # 日志发送失败不影响主流程
-        pass
+        # 发送失败时输出到 stdout，让 ProcessManager 通过 IPC 转发到 UI
+        print(f"[WeChatAgent][log:{log_type}] {content}", flush=True)
 
 
 class WeChatAgent:
@@ -231,6 +246,7 @@ class WeChatAgent:
         else:
             wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
 
+        self._wx_cli_path = wx_cli_path  # 存储 wx_cli_path（CLI 参数优先于 config）
         self.mapper = WxidMapper(wx_cli_path)
         # 不再需要校验 AI 配置，因为 AI 调用统一走 SightFlow Provider
         self.message_queue: Optional[MessageQueue] = None
@@ -269,10 +285,79 @@ class WeChatAgent:
         content = msg.get('content', '')[:50]
         return f"{ts}:{sender}:{hash(content)}"
 
+    def _ensure_daemon_running(self) -> bool:
+        """确保 wx-daemon 正在运行，必要时启动它（使用较长的超时时间）"""
+        try:
+            # 先检查 daemon 状态（快速路径）
+            result = subprocess.run(
+                [self._wx_cli_path, 'daemon', 'status'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                timeout=5
+            )
+            if result.returncode == 0 and '运行中' in result.stdout:
+                print("[WeChatAgent] wx-daemon 已在运行", flush=True)
+                return True
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as e:
+            print(f"[WeChatAgent] 检查 daemon 状态失败: {e}", flush=True)
+
+        # daemon 未运行，需要启动
+        print("[WeChatAgent] 启动 wx-daemon...", flush=True)
+        send_log_to_sightflow('info', '正在启动 wx-daemon...')
+
+        try:
+            # 触发 daemon 启动：执行一个简单的命令，daemon 会自动启动
+            # 使用较长的超时时间（30秒），因为首次启动可能需要初始化数据库等
+            result = subprocess.run(
+                [self._wx_cli_path, 'daemon', 'status'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                timeout=30
+            )
+
+            # 等待 daemon 完全就绪
+            time.sleep(1)
+
+            # 再次检查状态
+            result = subprocess.run(
+                [self._wx_cli_path, 'daemon', 'status'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                timeout=5
+            )
+            if result.returncode == 0 and '运行中' in result.stdout:
+                print("[WeChatAgent] wx-daemon 启动成功", flush=True)
+                send_log_to_sightflow('info', 'wx-daemon 启动成功')
+                return True
+            else:
+                print(f"[WeChatAgent] wx-daemon 启动失败: {result.stdout} {result.stderr}", flush=True)
+                send_log_to_sightflow('error', 'wx-daemon 启动失败')
+                return False
+
+        except subprocess.TimeoutExpired:
+            print("[WeChatAgent] wx-daemon 启动超时（>30秒）", flush=True)
+            send_log_to_sightflow('error', 'wx-daemon 启动超时')
+            return False
+        except Exception as e:
+            print(f"[WeChatAgent] wx-daemon 启动异常: {e}", flush=True)
+            send_log_to_sightflow('error', f'wx-daemon 启动异常: {e}')
+            return False
+
     def start(self):
         """启动 Agent"""
         print("[WeChatAgent] 启动中...", flush=True)
         send_log_to_sightflow('info', 'WeChat Agent 启动中...')
+
+        # 确保 wx-daemon 正在运行（首次启动可能需要较长时间）
+        if not self._ensure_daemon_running():
+            print("[WeChatAgent] wx-daemon 启动失败，退出", flush=True)
+            send_log_to_sightflow('error', 'wx-daemon 启动失败')
+            return
 
         # 初始化映射表
         print("[WeChatAgent] 初始化联系人映射表...", flush=True)
@@ -346,18 +431,16 @@ class WeChatAgent:
 
     def _get_new_messages(self) -> List[dict]:
         """使用 wx new-messages 获取自上次检查以来的新消息"""
-        config = self._config_watcher.get_config()
-        wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
         try:
-            # Build command
-            cmd = [wx_cli_path, 'new-messages', '--json', '-n', '50']
+            # Build command（使用 __init__ 中存储的 wx_cli_path，而非 config 中的路径）
+            cmd = [self._wx_cli_path, 'new-messages', '--json', '-n', '50']
 
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
-                timeout=15
+                timeout=20  # 增加超时时间，daemon 可能仍在初始化
             )
 
             if result.returncode != 0:

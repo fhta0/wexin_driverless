@@ -181,8 +181,14 @@ glue-layer ──HTTP POST──▶ SightFlow Skill Server (:12680)
 
 **组件间通信方式**：
 - **glue-layer → wx-cli**：`subprocess.run(['wx', 'new-messages', ...])` → wx 客户端自动连 Named Pipe/UDS
-- **glue-layer → SightFlow**：HTTP API（`POST /skill/generate-reply`、`POST /skill/send-message`）
-- **SightFlow → wx-cli**：同样通过 IPC handlers spawn `wx` 子命令（如 `wechat-agent:getGroups`）
+- **glue-layer → SightFlow**：HTTP API
+  - `POST /skill/generate-reply` — AI 回复生成（使用 `vision.apiKey` 回退）
+  - `POST /skill/send-message` — 消息发送（RPA）
+  - `POST /skill/log` — 结构化日志上报（失败时回退到 stdout）
+  - `POST /skill/alert` — 告警上报（5 分钟去重）
+  - `GET /skill/autopilot` — 查询自动驾驶状态
+- **SightFlow → wx-cli**：同样通过 IPC handlers spawn `wx` 子命令（如 `wechat-agent:detectWxid`，使用 contacts 回退）
+- **SightFlow → UI**：IPC 事件 `wechat-agent:glue-layer-log`（日志广播到所有窗口）
 
 **wx-cli daemon 就绪**：
 - **无需就绪信号协议**。daemon 由 `ensure_daemon()` 自动管理，首次 `wx` 命令调用时自动启动
@@ -236,8 +242,7 @@ glue-layer 定时轮询
 
 ### 3.4 wx-cli 通信机制
 
-**wx-cli 不使用 TCP 端口**，而是使用：
-**wx-cli 通信机制**：
+**wx-cli 通信机制**（不使用 TCP 端口）：
 - **Windows**: Named Pipe `\\.\pipe\wx-cli`
 - **Linux/macOS**: Unix Domain Socket `~/.wx-cli/wx-cli.sock`（Windows 上对应 `%USERPROFILE%\.wx-cli\`）
 
@@ -264,11 +269,10 @@ glue-layer 通过 `subprocess.run(['wx', 'sessions', ...])` 调用 wx-cli，wx �
 - glue-layer 状态：运行中 / 已停止 / 错误
 - 微信连接状态：已连接 / 未连接
 - **自动回复开关（toggle 按钮）**：
-  - `POST /skill/autopilot` 端点**已实现**（`skill-server.ts:461-463`）
-  - UI toggle **已实现**（`App.tsx:176-315` ControlPanel 组件）
-  - **当前缺陷**：状态存于内存变量（`let autopilotEnabled = true`），重启后丢失
-  - **需修复**：持久化到 electron-store，启动时从 store 读取初始值
-  - 当前默认值：`true`（启用）。产品化后应改为从 electron-store 读取，首次运行默认关闭
+  - `POST /skill/autopilot` 端点**已实现**（`skill-server.ts`）
+  - UI toggle **已实现**（`App.tsx` ControlPanel 组件）
+  - **已修复**：持久化到 electron-store（`autopilot.enabled`），启动时从 store 读取初始值
+  - 默认值：`true`（启用，用户期望安装后即可自动监控）
 - 统计信息：已尝试发送消息数、已回复消息数（**注意：不保证送达确认，仅代表 RPA 动作已执行**）
 
 #### 4.1.2 配置界面（扩展现有设置页）
@@ -277,6 +281,16 @@ glue-layer 通过 `subprocess.run(['wx', 'sessions', ...])` 调用 wx-cli，wx �
 - AI 模型选择（已有，复用）
 - 回复策略：延迟、频率限制等
 - 高级选项：打开配置文件、导出诊断包
+
+#### 4.1.3 日志查看器（设置 → 日志 tab）
+
+- **数据来源**：
+  - 历史日志：`GET /skill/logs`（skill-server 500 条环形缓冲区）
+  - 实时日志：IPC 事件 `wechat-agent:glue-layer-log`
+- **功能**：按类型过滤（收到/回复/跳过/监控/错误/信息/心跳）、文本搜索、暂停/继续、清空
+- **过滤按钮**：只显示当前有日志的类型（避免空按钮混淆）
+- **连接失败**：显示错误提示 + 重试按钮（GET 请求带 3 次重试）
+- **日志发送可靠性**：glue-layer `send_log_to_sightflow()` 失败时输出到 stdout，由 ProcessManager 通过 IPC 转发，日志不丢失
 
 ### 4.2 首次启动引导
 
@@ -297,10 +311,10 @@ glue-layer 通过 `subprocess.run(['wx', 'sessions', ...])` 调用 wx-cli，wx �
     │   }
     └─ 已存在 → 加载配置
     ↓
-3. 自动获取 identity.wxid：
-    ├─ 调用 wx whoami --json（**需先在 wx-cli 实现此命令，当前未实现**）
-    ├─ 如果失败/不可用 → 留空，引导用户手动填写
-    └─ 成功 → 写入 config.json
+3. 自动获取 identity.wxid（**已实现回退机制**）：
+    ├─ 方式 1：调用 `wx whoami --json`（部分 wx-cli 版本支持）
+    ├─ 方式 2（回退）：调用 `wx contacts --json`，提取 `display === "192"` 的联系人 wxid
+    └─ 两者都失败 → 留空，引导用户手动填写
     ↓
 4. 启动 glue-layer（传入 CLI 参数）
     └─ wx-cli daemon 会在首次 wx 命令调用时自动启动（无需显式管理）
@@ -321,12 +335,11 @@ glue-layer 通过 `subprocess.run(['wx', 'sessions', ...])` 调用 wx-cli，wx �
 - SightFlow UI 应检测 wx-cli 初始化状态（通过 `wx ping` 测试）
 - 如果初始化失败，在设置页显示引导信息
 
-**identity.wxid 自动发现**（**前置依赖：需先实现 `wx whoami` 命令**）：
-- wx-cli **当前未实现** `whoami` 子命令（源码中仅有 shell 占位符 `transport.rs:102`）
-- 实现方案：从 contact 数据库中提取 `flag=0` 的记录（即自己的 wxid）
-- UI 的"自动检测 wxid"按钮已接线（`WechatAgentSettings.tsx:87-96`），但命令不存在会导致永久失败
-- **MVP 前置任务**：在 wx-cli 实现 `wx whoami [--json]` 子命令
-- 在 whoami 实现前：UI "自动检测"按钮应禁用 + tooltip 提示"请先升级 wx-cli"
+**identity.wxid 自动发现**（**已实现双模式回退**）：
+- wx-cli 部分版本不支持 `whoami` 子命令
+- **已实现回退方案**：`wechat-agent:detectWxid` 先尝试 `wx whoami --json`，失败后回退到 `wx contacts --json`（自用户 `display === "192"`）
+- UI 的"自动检测 wxid"按钮已接线（`WechatAgentSettings.tsx`），两种模式均可用
+- wx-cli 诊断（`wechat-agent:diagnose`）同样使用 contacts 回退
 
 **AI 配置流程**（通过 SightFlow Provider 系统）：
 1. 用户在 SightFlow 设置页选择 Provider（豆包/OpenAI/...）
@@ -534,10 +547,10 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 **wx-cli 首次初始化**（首次启动引导时执行）：
 ```
-1. 检测 wx-cli 是否已初始化（检查 ~/.wx-cli/config.json 是否存在）
+1. 检测 wx-cli 是否已初始化（检查 ~/.wx-cli/config.json 是否存在，Windows 上为 `%USERPROFILE%\.wx-cli\config.json`）
     ├─ 已存在 → 跳过
     └─ 不存在 → 自动探测 WeChat DB 路径和密钥
-                ├─ 成功 → 写入 ~/.wx-cli/config.json
+                ├─ 成功 → 写入 ~/.wx-cli/config.json（Windows 上为 `%USERPROFILE%\.wx-cli\config.json`）
                 └─ 失败 → 引导用户手动指定 WeChat 数据目录：
                           "请找到 WeChat 的数据文件夹（通常在 %APPDATA%\Tencent\WeChat\xwechat_files）"
 ```
@@ -743,7 +756,7 @@ extraResources:
 - [x] **glue-layer 是否需要修改以支持 PyInstaller 打包？**
   - ✅ 需要修改（已在 §8.2 列出）：
     - PID/LOCK 文件路径改为 `%APPDATA%\WeChatAgent\`
-    - 添加 CLI 参数解析（`--wx-cli-path`、`--sightflow-port`）
+    - 添加 CLI 参数解析（`--wx-cli-path`、`--sightflow-port`、`--config`）
     - 添加 `logging.FileHandler` 输出到 `%APPDATA%\WeChatAgent\logs\`
     - identity.names 空数组行为改为不回复
     - autopilot 检查失败改为默认关闭

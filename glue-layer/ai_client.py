@@ -39,13 +39,20 @@ class AIClient:
                     return data.get('reply')
                 else:
                     error = data.get('error', 'unknown')
+                    msg = data.get('message', '')
                     if error == 'skip':
                         print(f"[AIClient] AI 决定不回复")
                         return None
-                    print(f"[AIClient] 生成回复失败: {error}")
+                    print(f"[AIClient] 生成回复失败: {error} {msg}")
                     return None
             else:
-                print(f"[AIClient] HTTP 错误: {response.status_code}")
+                # 尝试读取响应体中的详细错误
+                try:
+                    err_body = response.json()
+                    err_detail = err_body.get('error', '') or err_body.get('message', '') or response.text[:200]
+                except Exception:
+                    err_detail = response.text[:200] if response.text else ''
+                print(f"[AIClient] HTTP 错误 {response.status_code}: {err_detail}")
                 return None
 
         except requests.exceptions.Timeout:

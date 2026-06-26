@@ -14,73 +14,103 @@ class WxidMapper:
         self._group_map: Dict[str, str] = {}  # room_id → group_name
 
     def refresh(self) -> bool:
-        """从 wx contacts 和 wx sessions 刷新映射表"""
+        """从 wx contacts 和 wx sessions 刷新映射表
+
+        尽可能加载数据，部分命令失败时仍返回 True。
+        仅在 wx-cli 本身完全不可用时返回 False。
+        """
+        any_success = False
+        errors = []
+
+        # 1. 加载联系人映射
         try:
-            # 1. 加载联系人映射
             result = subprocess.run(
                 [self.wx_cli_path, 'contacts', '--json'],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
-                timeout=10
+                timeout=20  # 增加超时时间，daemon 可能仍在初始化
             )
 
             if result.returncode == 0:
-                contacts = json.loads(result.stdout)
-                for contact in contacts:
-                    username = contact.get('username', '')
-                    display = contact.get('display', '') or contact.get('remark', '') or username
+                try:
+                    contacts = json.loads(result.stdout)
+                    for contact in contacts:
+                        username = contact.get('username', '')
+                        display = contact.get('display', '') or contact.get('remark', '') or username
 
-                    # 过滤企业微信客服/公众号类型
-                    if '@openim' in username or '@kefu' in username or '@weclaw' in username:
-                        continue
+                        # 过滤企业微信客服/公众号类型
+                        if '@openim' in username or '@kefu' in username or '@weclaw' in username:
+                            continue
 
-                    if '@chatroom' in username:
-                        # 只有当手动配置中没有这个群时才覆盖
-                        if username not in self._group_map:
-                            self._group_map[username] = display
-                    else:
-                        self._name_map[username] = display
+                        if '@chatroom' in username:
+                            # 只有当手动配置中没有这个群时才覆盖
+                            if username not in self._group_map:
+                                self._group_map[username] = display
+                        else:
+                            self._name_map[username] = display
+                    any_success = True
+                except json.JSONDecodeError as e:
+                    errors.append(f'contacts JSON 解析失败: {e}')
+            else:
+                errors.append(f'wx contacts 失败 (code={result.returncode})')
+        except subprocess.TimeoutExpired:
+            errors.append('wx contacts 超时')
+        except Exception as e:
+            errors.append(f'wx contacts 异常: {e}')
 
-            # 2. 加载群映射（从 sessions）
+        # 2. 加载群映射（从 sessions）
+        try:
             result = subprocess.run(
                 [self.wx_cli_path, 'sessions', '--json'],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
-                timeout=10
+                timeout=20  # 增加超时时间
             )
 
             if result.returncode == 0:
-                data = json.loads(result.stdout)
-                sessions = data.get('sessions', [])
-                for session in sessions:
-                    username = session.get('username', '')
-                    chat_name = session.get('chat', '')
-                    chat_type = session.get('chat_type', '')
+                try:
+                    data = json.loads(result.stdout)
+                    sessions = data.get('sessions', [])
+                    for session in sessions:
+                        username = session.get('username', '')
+                        chat_name = session.get('chat', '')
+                        chat_type = session.get('chat_type', '')
 
-                    if chat_type == 'group' and '@chatroom' in username:
-                        # 只有当手动配置中没有这个群时才尝试从其他来源获取群名
-                        if username not in self._group_map:
-                            # 如果 sessions 返回的 chat 不是 room_id，使用它作为群名
-                            if chat_name and '@chatroom' not in chat_name:
-                                self._group_map[username] = chat_name
-                            else:
-                                # 尝试从历史消息中提取群名
-                                group_name = self._extract_group_name_from_history(username)
-                                if group_name:
-                                    self._group_map[username] = group_name
+                        if chat_type == 'group' and '@chatroom' in username:
+                            # 只有当手动配置中没有这个群时才尝试从其他来源获取群名
+                            if username not in self._group_map:
+                                # 如果 sessions 返回的 chat 不是 room_id，使用它作为群名
+                                if chat_name and '@chatroom' not in chat_name:
+                                    self._group_map[username] = chat_name
                                 else:
-                                    # 兜底：使用 room_id
-                                    self._group_map[username] = username
-
-            print(f"[WxidMapper] 已加载 {len(self._name_map)} 联系人, {len(self._group_map)} 群", flush=True)
-            print(f"[WxidMapper] 群映射: {json.dumps(self._group_map, ensure_ascii=False)}", flush=True)
-            return True
-
+                                    # 尝试从历史消息中提取群名
+                                    group_name = self._extract_group_name_from_history(username)
+                                    if group_name:
+                                        self._group_map[username] = group_name
+                                    else:
+                                        # 兜底：使用 room_id
+                                        self._group_map[username] = username
+                    any_success = True
+                except json.JSONDecodeError as e:
+                    errors.append(f'sessions JSON 解析失败: {e}')
+            else:
+                errors.append(f'wx sessions 失败 (code={result.returncode})')
+        except subprocess.TimeoutExpired:
+            errors.append('wx sessions 超时')
         except Exception as e:
-            print(f"[WxidMapper] 刷新失败: {e}", flush=True)
-            return False
+            errors.append(f'wx sessions 异常: {e}')
+
+        if errors:
+            print(f"[WxidMapper] 刷新警告: {'; '.join(errors)}", flush=True)
+
+        print(f"[WxidMapper] 已加载 {len(self._name_map)} 联系人, {len(self._group_map)} 群", flush=True)
+        if self._group_map:
+            print(f"[WxidMapper] 群映射: {json.dumps(self._group_map, ensure_ascii=False)}", flush=True)
+
+        # 即使全部命令失败也返回 True，允许 agent 继续运行（后续轮询时会重试）
+        return True
 
     def _extract_group_name_from_history(self, room_id: str) -> str:
         """从群聊历史消息中提取群名（从系统消息中解析）"""
