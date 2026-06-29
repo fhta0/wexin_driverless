@@ -131,9 +131,47 @@ def check_single_instance() -> bool:
         # 尝试获取文件锁（非阻塞）
         lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
         if not _try_lock(lock_fd):
-            print(f"[WeChatAgent] 已有实例运行（文件锁被占用），退出", flush=True)
-            os.close(lock_fd)
-            return False
+            # 锁被占用，检查 PID 文件确认旧进程是否还活着
+            if os.path.exists(PID_FILE):
+                try:
+                    with open(PID_FILE, 'r') as f:
+                        old_pid = int(f.read().strip())
+                    if not _process_alive(old_pid):
+                        # 旧进程已不在，强制清理锁文件
+                        print(f"[WeChatAgent] 旧进程 (PID: {old_pid}) 已不在运行，清理遗留锁文件", flush=True)
+                        os.close(lock_fd)
+                        lock_fd = None
+                        # 删除锁文件以强制释放锁
+                        if os.path.exists(LOCK_FILE):
+                            os.remove(LOCK_FILE)
+                        # 重新尝试获取锁
+                        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
+                        if not _try_lock(lock_fd):
+                            print(f"[WeChatAgent] 清理锁文件后仍无法获取锁，退出", flush=True)
+                            os.close(lock_fd)
+                            return False
+                        # 获取锁成功，继续执行后续逻辑
+                    else:
+                        print(f"[WeChatAgent] 已有实例运行（文件锁被占用，PID: {old_pid}），退出", flush=True)
+                        os.close(lock_fd)
+                        return False
+                except (ValueError, IOError) as e:
+                    print(f"[WeChatAgent] 读取 PID 文件失败: {e}，清理锁文件", flush=True)
+                    os.close(lock_fd)
+                    lock_fd = None
+                    if os.path.exists(LOCK_FILE):
+                        os.remove(LOCK_FILE)
+                    # 重新尝试获取锁
+                    lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
+                    if not _try_lock(lock_fd):
+                        print(f"[WeChatAgent] 清理锁文件后仍无法获取锁，退出", flush=True)
+                        os.close(lock_fd)
+                        return False
+            else:
+                # 没有 PID 文件但锁被占用，可能是其他情况
+                print(f"[WeChatAgent] 文件锁被占用且无 PID 文件，等待后重试...", flush=True)
+                os.close(lock_fd)
+                return False
 
         # 获取锁成功，检查 PID 文件
         if os.path.exists(PID_FILE):
@@ -141,7 +179,7 @@ def check_single_instance() -> bool:
                 with open(PID_FILE, 'r') as f:
                     old_pid = int(f.read().strip())
 
-                if _process_alive(old_pid):
+                if _process_alive(old_pid) and old_pid != os.getpid():
                     print(f"[WeChatAgent] 已有实例运行 (PID: {old_pid})，退出", flush=True)
                     _unlock(lock_fd)
                     os.close(lock_fd)
@@ -287,6 +325,7 @@ class WeChatAgent:
 
     def _ensure_daemon_running(self) -> bool:
         """确保 wx-daemon 正在运行，必要时启动它（使用较长的超时时间）"""
+        print(f"[WeChatAgent] 检查 daemon 状态，wx_cli_path: {self._wx_cli_path}", flush=True)
         try:
             # 先检查 daemon 状态（快速路径）
             result = subprocess.run(
@@ -296,11 +335,14 @@ class WeChatAgent:
                 encoding='utf-8',
                 timeout=5
             )
+            print(f"[WeChatAgent] daemon status 返回: code={result.returncode}, stdout={result.stdout.strip()}", flush=True)
             if result.returncode == 0 and '运行中' in result.stdout:
                 print("[WeChatAgent] wx-daemon 已在运行", flush=True)
                 return True
+            else:
+                print(f"[WeChatAgent] daemon 未在运行，准备启动...", flush=True)
         except subprocess.TimeoutExpired:
-            pass
+            print(f"[WeChatAgent] daemon status 检查超时", flush=True)
         except Exception as e:
             print(f"[WeChatAgent] 检查 daemon 状态失败: {e}", flush=True)
 
@@ -310,16 +352,58 @@ class WeChatAgent:
         send_log_to_sightflow('info', '正在启动 wx-daemon...')
 
         try:
-            # 使用 wx contacts --limit 0 触发 daemon 启动
-            # 这个命令会调用 transport::send()，内部会调用 ensure_daemon()
-            # 使用较长的超时时间（30秒），因为首次启动可能需要初始化数据库等
+            # 第一步：触发 daemon 启动（使用简单的 whoami 命令，比 contacts 更快）
+            print(f"[WeChatAgent] 触发 daemon 启动...", flush=True)
+            subprocess.run(
+                [self._wx_cli_path, 'whoami', '--json'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                timeout=5  # 这个命令可能超时，因为我们只是触发启动
+            )
+        except subprocess.TimeoutExpired:
+            # 超时是正常的，因为 daemon 可能还在启动
+            print(f"[WeChatAgent] whoami 命令超时（daemon 可能仍在启动）", flush=True)
+        except Exception as e:
+            print(f"[WeChatAgent] whoami 命令失败: {e}", flush=True)
+
+        # 第二步：循环检查 daemon 状态，等待它就绪（最长 60 秒）
+        print(f"[WeChatAgent] 等待 daemon 就绪...", flush=True)
+        for i in range(12):  # 最多等待 60 秒（12 * 5 秒）
+            time.sleep(5)
+            try:
+                result = subprocess.run(
+                    [self._wx_cli_path, 'daemon', 'status'],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    timeout=5
+                )
+                if result.returncode == 0 and '运行中' in result.stdout:
+                    print(f"[WeChatAgent] daemon 已就绪（等待了 {(i+1)*5} 秒）", flush=True)
+                    break
+                else:
+                    print(f"[WeChatAgent] 等待 daemon... ({(i+1)*5}/60 秒)", flush=True)
+            except Exception as e:
+                print(f"[WeChatAgent] 检查 daemon 状态失败: {e}", flush=True)
+        else:
+            # 循环结束，daemon 仍未就绪
+            print(f"[WeChatAgent] daemon 启动超时（60 秒）", flush=True)
+            send_log_to_sightflow('error', 'daemon 启动超时（60 秒）')
+            return False
+
+        # 第三步：daemon 已就绪，可以尝试执行命令
+        try:
+            # 使用 wx contacts --limit 0 测试连接
+            print(f"[WeChatAgent] 测试 daemon 连接...", flush=True)
             result = subprocess.run(
                 [self._wx_cli_path, 'contacts', '--json', '--limit', '0'],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
-                timeout=30
+                timeout=10  # daemon 已就绪，这个命令应该很快
             )
+            print(f"[WeChatAgent] contacts 命令返回: code={result.returncode}, stdout={result.stdout[:100]}", flush=True)
 
             if result.returncode != 0:
                 # 命令失败，检查是否是因为没有运行 wx init
