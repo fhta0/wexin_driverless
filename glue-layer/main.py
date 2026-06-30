@@ -285,6 +285,9 @@ class WeChatAgent:
             wx_cli_path = config.advanced.wx_cli_path if config else 'wx'
 
         self._wx_cli_path = wx_cli_path  # 存储 wx_cli_path（CLI 参数优先于 config）
+        # 设置 wx.exe 的工作目录，确保 wx-cli 能找到 config.json
+        # wx-cli 按 cwd > exe_dir > ~/.wx-cli 的顺序查找配置文件
+        self._wx_cli_dir = os.path.dirname(os.path.abspath(wx_cli_path)) if wx_cli_path != 'wx' else None
         self.mapper = WxidMapper(wx_cli_path)
         # 不再需要校验 AI 配置，因为 AI 调用统一走 SightFlow Provider
         self.message_queue: Optional[MessageQueue] = None
@@ -333,7 +336,8 @@ class WeChatAgent:
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
-                timeout=5
+                timeout=5,
+                cwd=self._wx_cli_dir
             )
             print(f"[WeChatAgent] daemon status 返回: code={result.returncode}, stdout={result.stdout.strip()}", flush=True)
             if result.returncode == 0 and '运行中' in result.stdout:
@@ -354,39 +358,70 @@ class WeChatAgent:
         try:
             # 第一步：触发 daemon 启动（使用简单的 whoami 命令，比 contacts 更快）
             print(f"[WeChatAgent] 触发 daemon 启动...", flush=True)
-            subprocess.run(
+            print(f"[WeChatAgent] 执行命令: {self._wx_cli_path} whoami --json", flush=True)
+
+            # 使用 Popen 以便更好地控制超时和输出
+            process = subprocess.Popen(
                 [self._wx_cli_path, 'whoami', '--json'],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding='utf-8',
-                timeout=5  # 这个命令可能超时，因为我们只是触发启动
+                cwd=self._wx_cli_dir
             )
-        except subprocess.TimeoutExpired:
-            # 超时是正常的，因为 daemon 可能还在启动
-            print(f"[WeChatAgent] whoami 命令超时（daemon 可能仍在启动）", flush=True)
-        except Exception as e:
-            print(f"[WeChatAgent] whoami 命令失败: {e}", flush=True)
+
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+                print(f"[WeChatAgent] whoami 命令完成: code={process.returncode}, stdout={stdout[:200]}, stderr={stderr[:200]}", flush=True)
+            except subprocess.TimeoutExpired:
+                print(f"[WeChatAgent] whoami 命令超时（10秒），终止进程...", flush=True)
+                process.kill()
+                try:
+                    stdout, stderr = process.communicate(timeout=2)
+                    print(f"[WeChatAgent] 进程已终止，剩余输出: stdout={stdout[:100]}, stderr={stderr[:100]}", flush=True)
+                except:
+                    print(f"[WeChatAgent] 进程已强制终止", flush=True)
+            except Exception as e:
+                print(f"[WeChatAgent] whoami 命令执行异常: {e}", flush=True)
+                try:
+                    process.kill()
+                except:
+                    pass
 
         # 第二步：循环检查 daemon 状态，等待它就绪（最长 60 秒）
-        print(f"[WeChatAgent] 等待 daemon 就绪...", flush=True)
+        print(f"[WeChatAgent] 等待 daemon 就绪（最长 60 秒）...", flush=True)
+        send_log_to_sightflow('info', '等待 daemon 就绪...')
+
+        daemon_ready = False
         for i in range(12):  # 最多等待 60 秒（12 * 5 秒）
             time.sleep(5)
+            elapsed = (i + 1) * 5
+            print(f"[WeChatAgent] 检查 daemon 状态... ({elapsed}/60 秒)", flush=True)
+
             try:
                 result = subprocess.run(
                     [self._wx_cli_path, 'daemon', 'status'],
                     capture_output=True,
                     text=True,
                     encoding='utf-8',
-                    timeout=5
+                    timeout=5,
+                    cwd=self._wx_cli_dir
                 )
-                if result.returncode == 0 and '运行中' in result.stdout:
-                    print(f"[WeChatAgent] daemon 已就绪（等待了 {(i+1)*5} 秒）", flush=True)
+                print(f"[WeChatAgent] daemon status 返回: code={result.returncode}, stdout={result.stdout[:100]}", flush=True)
+
+                if result.returncode == 0 and ('运行中' in result.stdout or 'running' in result.stdout.lower()):
+                    print(f"[WeChatAgent] daemon 已就绪（等待了 {elapsed} 秒）", flush=True)
+                    send_log_to_sightflow('info', f'daemon 已就绪（{elapsed}秒）')
+                    daemon_ready = True
                     break
                 else:
-                    print(f"[WeChatAgent] 等待 daemon... ({(i+1)*5}/60 秒)", flush=True)
+                    print(f"[WeChatAgent] daemon 未就绪，继续等待...", flush=True)
+            except subprocess.TimeoutExpired:
+                print(f"[WeChatAgent] 检查 daemon 状态超时", flush=True)
             except Exception as e:
                 print(f"[WeChatAgent] 检查 daemon 状态失败: {e}", flush=True)
-        else:
+
+        if not daemon_ready:
             # 循环结束，daemon 仍未就绪
             print(f"[WeChatAgent] daemon 启动超时（60 秒）", flush=True)
             send_log_to_sightflow('error', 'daemon 启动超时（60 秒）')
