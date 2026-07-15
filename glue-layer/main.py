@@ -14,6 +14,26 @@
 # 配置：
 #   %APPDATA%\WeChatAgent\config.json（由 SightFlow UI 管理）
 #   CLI 参数 --wx-cli-path 优先于 config 中的 advanced.wx_cli_path
+#
+# stdout 编码：强制 UTF-8，避免 Windows 上 GBK 与 UTF-8 混合输出导致的管道死锁
+#   （典型症状：PowerShell 重定向或某些父进程的管道处理在混合编码时卡住，
+#    表现为 Python 的 print(flush=True) 阻塞在 WriteFile 系统调用）
+import sys
+import os
+
+# 在所有其他 import 之前设置 stdout 编码。
+# PyInstaller 打包的 exe 里 sys.stdout 可能是自定义 FileIO，
+# reconfigure 失败也无所谓，此时 Python 默认就是 utf-8 或系统代码页。
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+# 同时把 PYTHONIOENCODING 设到环境变量，作为 subprocess 子进程的保险
+os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+
 import subprocess
 import json
 import time
@@ -355,38 +375,37 @@ class WeChatAgent:
         print("[WeChatAgent] 启动 wx-daemon...", flush=True)
         send_log_to_sightflow('info', '正在启动 wx-daemon...')
 
+        # 第一步：触发 daemon 启动（使用简单的 whoami 命令，比 contacts 更快）
+        print(f"[WeChatAgent] 触发 daemon 启动...", flush=True)
+        print(f"[WeChatAgent] 执行命令: {self._wx_cli_path} whoami --json", flush=True)
+
+        # 使用 Popen 以便更好地控制超时和输出
+        process = subprocess.Popen(
+            [self._wx_cli_path, 'whoami', '--json'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            cwd=self._wx_cli_dir
+        )
+
         try:
-            # 第一步：触发 daemon 启动（使用简单的 whoami 命令，比 contacts 更快）
-            print(f"[WeChatAgent] 触发 daemon 启动...", flush=True)
-            print(f"[WeChatAgent] 执行命令: {self._wx_cli_path} whoami --json", flush=True)
-
-            # 使用 Popen 以便更好地控制超时和输出
-            process = subprocess.Popen(
-                [self._wx_cli_path, 'whoami', '--json'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                cwd=self._wx_cli_dir
-            )
-
+            stdout, stderr = process.communicate(timeout=10)
+            print(f"[WeChatAgent] whoami 命令完成: code={process.returncode}, stdout={stdout[:200]}, stderr={stderr[:200]}", flush=True)
+        except subprocess.TimeoutExpired:
+            print(f"[WeChatAgent] whoami 命令超时（10秒），终止进程...", flush=True)
+            process.kill()
             try:
-                stdout, stderr = process.communicate(timeout=10)
-                print(f"[WeChatAgent] whoami 命令完成: code={process.returncode}, stdout={stdout[:200]}, stderr={stderr[:200]}", flush=True)
-            except subprocess.TimeoutExpired:
-                print(f"[WeChatAgent] whoami 命令超时（10秒），终止进程...", flush=True)
+                stdout, stderr = process.communicate(timeout=2)
+                print(f"[WeChatAgent] 进程已终止，剩余输出: stdout={stdout[:100]}, stderr={stderr[:100]}", flush=True)
+            except:
+                print(f"[WeChatAgent] 进程已强制终止", flush=True)
+        except Exception as e:
+            print(f"[WeChatAgent] whoami 命令执行异常: {e}", flush=True)
+            try:
                 process.kill()
-                try:
-                    stdout, stderr = process.communicate(timeout=2)
-                    print(f"[WeChatAgent] 进程已终止，剩余输出: stdout={stdout[:100]}, stderr={stderr[:100]}", flush=True)
-                except:
-                    print(f"[WeChatAgent] 进程已强制终止", flush=True)
-            except Exception as e:
-                print(f"[WeChatAgent] whoami 命令执行异常: {e}", flush=True)
-                try:
-                    process.kill()
-                except:
-                    pass
+            except:
+                pass
 
         # 第二步：循环检查 daemon 状态，等待它就绪（最长 60 秒）
         print(f"[WeChatAgent] 等待 daemon 就绪（最长 60 秒）...", flush=True)
@@ -779,7 +798,7 @@ def parse_args():
     parser.add_argument('--sightflow-port', dest='sightflow_port', type=int, default=None,
                         help='SightFlow API 端口（覆盖默认 12680）')
     parser.add_argument('--config', dest='config_path',
-                        help='配置文件路径（默认 %APPDATA%\\WeChatAgent\\config.json）')
+                        help=r'配置文件路径（默认 %APPDATA%\WeChatAgent\config.json）'.replace('%', '%%'))
     return parser.parse_args()
 
 
