@@ -86,6 +86,7 @@ from config_model import AgentConfig, get_config_path
 from wxid_mapper import WxidMapper
 from ai_client import AIClient
 from message_queue import MessageQueue
+from history_context import get_history_context
 
 # 进程互斥：PID 文件路径（放在 %APPDATA%\WeChatAgent\ 下，兼容 PyInstaller）
 PID_FILE = os.path.join(get_data_dir(), '.glue-layer.pid')
@@ -731,6 +732,34 @@ class WeChatAgent:
 
         # 发送收到消息日志到 SightFlow
         send_log_to_sightflow('receive', content[:50] + '...' if len(content) > 50 else content, target)
+
+        # === 知识库 Phase 1：群聊注入历史对话前缀 ===
+        # 在调 AI 之前拉该群最近 30 条文本消息，拼成"[最近对话]"前缀塞进 context，
+        # 让 AI 能理解"刚才说的那个""上午的方案"这类回指性问题。
+        # 任何异常内部降级为空字符串，不阻塞主流程。
+        #
+        # [回复指引] 是一段 system hint：doubao-seed 系列对"根据上文回答"指令
+        # 不够敏感，需要显式告诉它优先参考 [最近对话] 里的内容，避免自说自话。
+        # 控制在 50 字左右，不会显著增加 token 开销。
+        if chat_type == 'group':
+            history_prefix = get_history_context(
+                self._wx_cli_path,
+                self._wx_cli_dir,
+                username,
+                config.identity.wxid,
+            )
+            if history_prefix:
+                context = (
+                    f"{history_prefix}\n"
+                    f"[回复指引] 优先参考上方 [最近对话] 的内容，"
+                    f"理解回指（如'那个''刚才说的'）与延续话题，避免自说自话。\n"
+                    f"[当前消息]\n{context}"
+                )
+                send_log_to_sightflow(
+                    'info',
+                    f'已注入群历史 context ({len(history_prefix)} 字)',
+                    target,
+                )
 
         # AI 生成回复（使用从快照构建的客户端）
         reply = ai_client.generate_reply(context, target)

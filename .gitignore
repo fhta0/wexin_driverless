@@ -49,3 +49,4 @@ glue-layer/*.pid
 glue-layer/*_tmp.json
 
 *.exe
+MEMORY.md
