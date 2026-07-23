@@ -520,7 +520,7 @@ class WeChatAgent:
             return
 
         # 启动消息队列
-        self.message_queue = MessageQueue(self._send_message)
+        self.message_queue = MessageQueue(self._send_message, log_fn=send_log_to_sightflow)
         self.message_queue.start()
 
         # 开始轮询
@@ -803,20 +803,28 @@ class WeChatAgent:
             if response.status_code == 200:
                 data = response.json()
                 if data.get('ok'):
-                    print(f"[WeChatAgent] 发送成功: {contact}, elapsed={data.get('elapsed_ms')}ms", flush=True)
+                    elapsed = data.get('elapsed_ms')
+                    print(f"[WeChatAgent] 发送成功: {contact}, elapsed={elapsed}ms", flush=True)
+                    send_log_to_sightflow('send', f'发送成功 ({elapsed}ms)', contact)
                     return True
                 else:
-                    print(f"[WeChatAgent] 发送失败: {data.get('error')}", flush=True)
+                    err = data.get('error')
+                    print(f"[WeChatAgent] 发送失败: {err}", flush=True)
+                    send_log_to_sightflow('error', f'发送失败: {err}', contact)
                     return False
             else:
-                print(f"[WeChatAgent] HTTP 错误: {response.status_code}", flush=True)
+                body_preview = response.text[:80].replace('\n', ' ')
+                print(f"[WeChatAgent] HTTP 错误: {response.status_code} ({body_preview})", flush=True)
+                send_log_to_sightflow('error', f'HTTP 错误 {response.status_code}', contact)
                 return False
 
         except requests.exceptions.Timeout:
             print(f"[WeChatAgent] 发送超时: {contact}", flush=True)
+            send_log_to_sightflow('error', '发送超时', contact)
             return False
         except Exception as e:
             print(f"[WeChatAgent] 发送异常: {e}", flush=True)
+            send_log_to_sightflow('error', f'发送异常: {e}', contact)
             return False
 
 def parse_args():
