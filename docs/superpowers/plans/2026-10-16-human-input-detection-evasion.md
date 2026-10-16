@@ -458,7 +458,7 @@ export function generateBezierPath(
 
 `cd sightflow-desktop-agent && npm test -- src/core/rpa/human-input/__tests__/bezier.test.ts`
 
-Expected: 7 passed, 0 failed。
+Expected: 9 passed, 0 failed (easeInOut 3 + generateBezierPath 6)。
 
 - [ ] **Step 5: 加到 barrel**
 
